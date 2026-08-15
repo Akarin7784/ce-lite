@@ -16,8 +16,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS,
-    MEM_RELEASE, VIRTUAL_ALLOCATION_TYPE,
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+    PAGE_PROTECTION_FLAGS, MEM_RELEASE, VIRTUAL_ALLOCATION_TYPE,
 };
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject,
@@ -42,7 +42,15 @@ pub struct WindowsProcess {
     pid: u32,
     handle: HANDLE,
     info: ProcessInfo,
+    /// 区域枚举缓存（TTL 2 秒，扫描/区域查询复用；内存布局变化不频繁）。
+    regions_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<MemoryRegion>)>>,
 }
+
+// `HANDLE` 是裸指针包装、默认非 `Send`/`Sync`；Windows 的跨进程内存 API
+// （ReadProcessMemory/WriteProcessMemory/VirtualQueryEx）支持并发调用，
+// 因此进程句柄可以安全地跨线程共享。
+unsafe impl Send for WindowsProcess {}
+unsafe impl Sync for WindowsProcess {}
 
 pub fn open(pid: u32) -> Result<Box<dyn Process>, ProcessError> {
     let access =
@@ -59,15 +67,78 @@ pub fn open(pid: u32) -> Result<Box<dyn Process>, ProcessError> {
         })
         .unwrap_or_default();
 
+    // 位宽检测：读主模块 PE 头的机器类型（0x14c = i386，0x8664 = x64）。
+    let (arch, pointer_size) = detect_arch(handle, pid).unwrap_or((Arch::X64, 8));
+
     let info = ProcessInfo {
         pid,
         name,
-        // M1：值扫描不依赖位宽；arch/pointer_size 在 M2（反汇编）时按目标 PE 判定。
-        arch: Arch::X64,
-        pointer_size: 8,
+        arch,
+        pointer_size,
     };
 
-    Ok(Box::new(WindowsProcess { pid, handle, info }))
+    Ok(Box::new(WindowsProcess {
+        pid,
+        handle,
+        info,
+        regions_cache: std::sync::Mutex::new(None),
+    }))
+}
+
+/// 通过主模块 PE 头判定目标位宽（Wow64 进程返回 32 位）。
+pub(crate) fn detect_arch(handle: HANDLE, pid: u32) -> Option<(Arch, u8)> {
+    unsafe {
+        // Toolhelp 拿第一个模块基址（主模块）。
+        let snap = CreateToolhelp32Snapshot(
+            CREATE_TOOLHELP_SNAPSHOT_FLAGS(TH32CS_SNAPMODULE.0 | TH32CS_SNAPMODULE32.0),
+            pid,
+        )
+        .ok()?;
+        let mut entry = MODULEENTRY32W {
+            dwSize: size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Module32FirstW(snap, &mut entry).is_err() {
+            let _ = CloseHandle(snap);
+            return None;
+        }
+        let base = entry.modBaseAddr as usize as u64;
+        let _ = CloseHandle(snap);
+
+        // 读 DOS 头 → e_lfanew → PE 头 → 机器类型。
+        let mut dos = [0u8; 64];
+        let mut nread = 0usize;
+        ReadProcessMemory(
+            handle,
+            base as *const c_void,
+            dos.as_mut_ptr() as *mut c_void,
+            64,
+            Some(&mut nread),
+        )
+        .ok()?;
+        if nread < 64 || dos[0] != b'M' || dos[1] != b'Z' {
+            return None;
+        }
+        let pe_off = u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?);
+        let mut pe = [0u8; 8];
+        ReadProcessMemory(
+            handle,
+            (base + pe_off as u64) as *const c_void,
+            pe.as_mut_ptr() as *mut c_void,
+            8,
+            Some(&mut nread),
+        )
+        .ok()?;
+        if nread < 8 || pe[0..4] != [b'P', b'E', 0, 0] {
+            return None;
+        }
+        let machine = u16::from_le_bytes([pe[4], pe[5]]);
+        match machine {
+            0x14C => Some((Arch::X86, 4)),  // i386
+            0x8664 => Some((Arch::X64, 8)), // x86-64
+            _ => None,
+        }
+    }
 }
 
 pub fn list_processes() -> Result<Vec<ProcessInfo>, ProcessError> {
@@ -147,45 +218,19 @@ impl Process for WindowsProcess {
     }
 
     fn regions(&self) -> Result<Vec<MemoryRegion>, ProcessError> {
-        let mut regions = Vec::new();
-        let mut addr: usize = 0;
-
-        loop {
-            let mut mbi = MEMORY_BASIC_INFORMATION::default();
-            let n = unsafe {
-                VirtualQueryEx(
-                    self.handle,
-                    Some(addr as *const c_void),
-                    &mut mbi,
-                    size_of::<MEMORY_BASIC_INFORMATION>(),
-                )
-            };
-            if n == 0 {
-                break;
-            }
-
-            let base = mbi.BaseAddress as usize;
-            let size = mbi.RegionSize;
-            if mbi.State.0 == MEM_COMMIT {
-                let p = mbi.Protect.0;
-                regions.push(MemoryRegion {
-                    base: base as u64,
-                    size: size as u64,
-                    protection: p,
-                    readable: is_readable(p),
-                    writable: is_writable(p),
-                    executable: is_executable(p),
-                    name: None,
-                });
-            }
-
-            let next = base.checked_add(size);
-            match next {
-                Some(n) if n > addr => addr = n,
-                _ => break,
+        // TTL 缓存：2 秒内复用上次枚举结果。
+        if let Ok(guard) = self.regions_cache.lock() {
+            if let Some((at, cached)) = guard.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(2) {
+                    return Ok(cached.clone());
+                }
             }
         }
 
+        let regions = self.enumerate_regions()?;
+        if let Ok(mut guard) = self.regions_cache.lock() {
+            *guard = Some((std::time::Instant::now(), regions.clone()));
+        }
         Ok(regions)
     }
 
@@ -209,14 +254,31 @@ impl Process for WindowsProcess {
     fn write(&self, address: Address, bytes: &[u8]) -> Result<usize, ProcessError> {
         let mut nwritten = 0usize;
         unsafe {
-            WriteProcessMemory(
+            // 临时把页面改为可执行+可写（代码页补丁/内联钩子需要），写完恢复原保护。
+            let mut old = PAGE_PROTECTION_FLAGS(0);
+            let _ = VirtualProtectEx(
+                self.handle,
+                address as *const c_void,
+                bytes.len(),
+                PAGE_PROTECTION_FLAGS(PAGE_EXECUTE_READWRITE),
+                &mut old,
+            );
+            let r = WriteProcessMemory(
                 self.handle,
                 address as usize as *const c_void,
                 bytes.as_ptr() as *const c_void,
                 bytes.len(),
                 Some(&mut nwritten),
-            )
-            .map_err(|e| ProcessError::Write { address, reason: e.to_string() })?;
+            );
+            let mut dummy = PAGE_PROTECTION_FLAGS(0);
+            let _ = VirtualProtectEx(
+                self.handle,
+                address as *const c_void,
+                bytes.len(),
+                old,
+                &mut dummy,
+            );
+            r.map_err(|e| ProcessError::Write { address, reason: e.to_string() })?;
         }
         Ok(nwritten)
     }
@@ -273,6 +335,57 @@ impl Process for WindowsProcess {
             let _ = CloseHandle(snap);
             Ok(out)
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn raw_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        Some(self.handle)
+    }
+}
+
+impl WindowsProcess {
+    /// 无缓存的区域枚举（`regions()` 的底层实现）。
+    fn enumerate_regions(&self) -> Result<Vec<MemoryRegion>, ProcessError> {
+        let mut regions = Vec::new();
+        let mut addr: usize = 0;
+
+        loop {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            let n = unsafe {
+                VirtualQueryEx(
+                    self.handle,
+                    Some(addr as *const c_void),
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if n == 0 {
+                break;
+            }
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize;
+            if mbi.State.0 == MEM_COMMIT {
+                let p = mbi.Protect.0;
+                regions.push(MemoryRegion {
+                    base: base as u64,
+                    size: size as u64,
+                    protection: p,
+                    readable: is_readable(p),
+                    writable: is_writable(p),
+                    executable: is_executable(p),
+                    name: None,
+                });
+            }
+
+            let next = base.checked_add(size);
+            match next {
+                Some(n) if n > addr => addr = n,
+                _ => break,
+            }
+        }
+
+        Ok(regions)
     }
 }
 

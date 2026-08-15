@@ -43,6 +43,7 @@ impl Serve {
 
 #[test]
 fn debugger_breakpoint_and_registers() {
+    // 测试前需先 `cargo build -p ce-target`（CI 与本地均显式构建，见 README）。
     let target_exe = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/debug/ce-target.exe"

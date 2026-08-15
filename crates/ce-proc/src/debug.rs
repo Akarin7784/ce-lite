@@ -37,6 +37,123 @@ const INT3: u8 = 0xCC;
 const TRAP_FLAG: u32 = 0x100;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
+/// Wow64 进程里 32 位代码的断点/单步异常码（64 位内核转换后上报）。
+const STATUS_WX86_BREAKPOINT: i32 = 0x4000_001F;
+const STATUS_WX86_SINGLE_STEP: i32 = 0x4000_001E;
+
+// ---- Wow64（32 位目标）支持 ----
+
+/// i386 CONTEXT 结构（Windows 头文件布局；仅声明调试器需要的字段）。
+#[repr(C)]
+struct WOW64_CONTEXT {
+    context_flags: u32,
+    dr0: u32,
+    dr1: u32,
+    dr2: u32,
+    dr3: u32,
+    dr6: u32,
+    dr7: u32,
+    float_save: [u8; 112],
+    seg_gs: u32,
+    seg_fs: u32,
+    seg_es: u32,
+    seg_ds: u32,
+    edi: u32,
+    esi: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
+    ebp: u32,
+    eip: u32,
+    seg_cs: u32,
+    eflags: u32,
+    esp: u32,
+    seg_ss: u32,
+    extended_registers: [u8; 512],
+}
+
+const WOW64_CONTEXT_I386: u32 = 0x0001_0000;
+const WOW64_CONTEXT_CONTROL: u32 = 0x01;
+const WOW64_CONTEXT_INTEGER: u32 = 0x02;
+const WOW64_CONTEXT_DEBUG_REGISTERS: u32 = 0x10;
+
+// windows crate 未绑定 Wow64 API；kernel32 直接声明。
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn Wow64GetThreadContext(hthread: HANDLE, lpcontext: *mut WOW64_CONTEXT) -> i32;
+    fn Wow64SetThreadContext(hthread: HANDLE, lpcontext: *const WOW64_CONTEXT) -> i32;
+}
+
+/// 读取 32 位线程上下文（含 DR 寄存器）。
+fn get_wow64_context(thread: HANDLE) -> Result<WOW64_CONTEXT, String> {
+    let mut ctx: WOW64_CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.context_flags = WOW64_CONTEXT_I386
+        | WOW64_CONTEXT_CONTROL
+        | WOW64_CONTEXT_INTEGER
+        | WOW64_CONTEXT_DEBUG_REGISTERS;
+    let rc = unsafe { Wow64GetThreadContext(thread, &mut ctx) };
+    if rc == 0 {
+        return Err("Wow64GetThreadContext failed".to_string());
+    }
+    Ok(ctx)
+}
+
+/// 32 位上下文 → 统一 64 位 CONTEXT（低 32 位有效）。
+fn wow64_to_ctx(w: &WOW64_CONTEXT) -> CONTEXT {
+    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64 | CONTEXT_DEBUG_REGISTERS_AMD64;
+    ctx.Rip = w.eip as u64;
+    ctx.Rax = w.eax as u64;
+    ctx.Rbx = w.ebx as u64;
+    ctx.Rcx = w.ecx as u64;
+    ctx.Rdx = w.edx as u64;
+    ctx.Rsi = w.esi as u64;
+    ctx.Rdi = w.edi as u64;
+    ctx.Rsp = w.esp as u64;
+    ctx.Rbp = w.ebp as u64;
+    ctx.EFlags = w.eflags;
+    ctx.Dr0 = w.dr0 as u64;
+    ctx.Dr1 = w.dr1 as u64;
+    ctx.Dr2 = w.dr2 as u64;
+    ctx.Dr3 = w.dr3 as u64;
+    ctx.Dr6 = w.dr6 as u64;
+    ctx.Dr7 = w.dr7 as u64;
+    ctx
+}
+
+/// 统一 64 位 CONTEXT → 32 位上下文（截断到低 32 位）。
+fn ctx_to_wow64(ctx: &CONTEXT, w: &mut WOW64_CONTEXT) {
+    w.context_flags = WOW64_CONTEXT_I386
+        | WOW64_CONTEXT_CONTROL
+        | WOW64_CONTEXT_INTEGER
+        | WOW64_CONTEXT_DEBUG_REGISTERS;
+    w.eip = ctx.Rip as u32;
+    w.eax = ctx.Rax as u32;
+    w.ebx = ctx.Rbx as u32;
+    w.ecx = ctx.Rcx as u32;
+    w.edx = ctx.Rdx as u32;
+    w.esi = ctx.Rsi as u32;
+    w.edi = ctx.Rdi as u32;
+    w.esp = ctx.Rsp as u32;
+    w.ebp = ctx.Rbp as u32;
+    w.eflags = ctx.EFlags;
+    w.dr0 = ctx.Dr0 as u32;
+    w.dr1 = ctx.Dr1 as u32;
+    w.dr2 = ctx.Dr2 as u32;
+    w.dr3 = ctx.Dr3 as u32;
+    w.dr6 = ctx.Dr6 as u32;
+    w.dr7 = ctx.Dr7 as u32;
+}
+
+fn set_wow64_context(thread: HANDLE, ctx: &WOW64_CONTEXT) -> Result<(), String> {
+    let rc = unsafe { Wow64SetThreadContext(thread, ctx) };
+    if rc == 0 {
+        return Err("Wow64SetThreadContext failed".to_string());
+    }
+    Ok(())
+}
+
 /// `HANDLE` 含裸指针、默认非 `Send`；跨线程传给事件循环时用安全封装。
 #[derive(Clone, Copy)]
 struct RawHandle(HANDLE);
@@ -61,6 +178,8 @@ type Watchpoints = Arc<Mutex<[Option<Watchpoint>; 4]>>;
 pub struct Debugger {
     pid: u32,
     handle: HANDLE,
+    /// 目标是否为 32 位（Wow64）进程：寄存器/DR 访问走 WOW64_CONTEXT。
+    wow64: bool,
     event_rx: Receiver<DebugEvent>,
     resume_tx: Sender<()>,
     stop_tx: Sender<()>,
@@ -79,7 +198,7 @@ impl Debugger {
                 false,
                 pid,
             )
-            .map_err(|e| format!("OpenProcess: {e}"))?
+            .map_err(|e| classify_win32(&e, "OpenProcess"))?
         };
 
         let (event_tx, event_rx) = channel();
@@ -94,11 +213,15 @@ impl Debugger {
         let wp = watchpoints.clone();
         let st = step_requested.clone();
         let raw = RawHandle(handle);
+        // 目标是否 32 位（Wow64）：决定寄存器/DR 用哪套上下文 API。
+        let wow64 = crate::winproc::detect_arch(handle, pid)
+            .map(|(arch, _)| arch == ce_core::Arch::X86)
+            .unwrap_or(false);
         // 注意：DebugActiveProcess 必须与 WaitForDebugEvent 在同一线程。
         let thread = std::thread::spawn(move || {
             let attach_result = unsafe {
                 DebugActiveProcess(pid)
-                    .map_err(|e| format!("DebugActiveProcess: {e}"))
+                    .map_err(|e| classify_win32(&e, "DebugActiveProcess"))
                     .map(|_| {
                         let _ = DebugSetProcessKillOnExit(false);
                     })
@@ -108,7 +231,7 @@ impl Debugger {
                 return;
             }
             let _ = attach_tx.send(Ok(()));
-            event_loop(pid, raw, event_tx, resume_rx, stop_rx, bp, wp, st);
+            event_loop(pid, raw, event_tx, resume_rx, stop_rx, bp, wp, st, wow64);
             unsafe { let _ = DebugActiveProcessStop(pid); }
         });
 
@@ -127,6 +250,7 @@ impl Debugger {
         Ok(Debugger {
             pid,
             handle,
+            wow64,
             event_rx,
             resume_tx,
             stop_tx,
@@ -186,7 +310,7 @@ impl Debugger {
         let snapshot = *wps;
         drop(wps);
 
-        apply_watchpoints_to_all(self.pid, &snapshot);
+        apply_watchpoints_to_all(self.pid, &snapshot, self.wow64);
         Ok(())
     }
 
@@ -201,7 +325,7 @@ impl Debugger {
         let snapshot = *wps;
         drop(wps);
 
-        apply_watchpoints_to_all(self.pid, &snapshot);
+        apply_watchpoints_to_all(self.pid, &snapshot, self.wow64);
         Ok(())
     }
 
@@ -231,7 +355,12 @@ impl Debugger {
     /// 读取指定线程的寄存器。
     pub fn registers(&self, thread_id: u32) -> Result<Registers, String> {
         let thread = open_thread(thread_id)?;
-        let ctx = get_context(thread)?;
+        let ctx = if self.wow64 {
+            let w = get_wow64_context(thread)?;
+            wow64_to_ctx(&w)
+        } else {
+            get_context(thread)?
+        };
         let _ = unsafe { CloseHandle(thread) };
         Ok(registers_from_ctx(&ctx))
     }
@@ -239,9 +368,9 @@ impl Debugger {
     /// 写入指定线程的寄存器。
     pub fn set_registers(&self, thread_id: u32, regs: &Registers) -> Result<(), String> {
         let thread = open_thread(thread_id)?;
-        let mut ctx = get_context(thread)?;
+        let mut ctx = read_thread_ctx(thread, self.wow64)?;
         apply_registers(&mut ctx, regs);
-        set_context(thread, &ctx)?;
+        write_thread_ctx(thread, &ctx, self.wow64)?;
         let _ = unsafe { CloseHandle(thread) };
         Ok(())
     }
@@ -251,7 +380,7 @@ impl Debugger {
     /// 每帧记录 RIP/RBP/RSP；栈底（rbp 为 0 / 不再前进 / 不可读）时停止。
     pub fn stack(&self, thread_id: u32, max_frames: usize) -> Result<Vec<StackFrame>, String> {
         let thread = open_thread(thread_id)?;
-        let ctx = get_context(thread)?;
+        let ctx = read_thread_ctx(thread, self.wow64)?;
         let _ = unsafe { CloseHandle(thread) };
 
         let mut frames = Vec::new();
@@ -287,6 +416,19 @@ impl Drop for Debugger {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // 干净恢复：还原所有断点原字节、清除硬件监视点（不留痕迹）。
+        let bps: Vec<(Address, u8)> = self
+            .breakpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(a, b)| (*a, *b))
+            .collect();
+        for (addr, orig) in bps {
+            let _ = write_byte(self.handle, addr, orig);
+        }
+        self.breakpoints.lock().unwrap().clear();
+        apply_watchpoints_to_all(self.pid, &[None; 4], self.wow64);
         unsafe { let _ = CloseHandle(self.handle); }
     }
 }
@@ -349,6 +491,7 @@ fn event_loop(
     breakpoints: Breakpoints,
     watchpoints: Watchpoints,
     step_requested: Arc<Mutex<bool>>,
+    wow64: bool,
 ) {
     let h = handle.0;
     let mut pending_restore: Option<Address> = None;
@@ -373,11 +516,16 @@ fn event_loop(
             let info = unsafe { event.u.Exception };
             let code = info.ExceptionRecord.ExceptionCode.0; // i32
             let addr = info.ExceptionRecord.ExceptionAddress as u64;
+            // Wow64：32 位代码的 INT3/单步以 WX86 码上报。
+            let is_bp_code =
+                code == EXCEPTION_BREAKPOINT.0 || (wow64 && code == STATUS_WX86_BREAKPOINT);
+            let is_step_code =
+                code == EXCEPTION_SINGLE_STEP.0 || (wow64 && code == STATUS_WX86_SINGLE_STEP);
 
-            if code == EXCEPTION_BREAKPOINT.0 {
+            if is_bp_code {
                 let is_mine = breakpoints.lock().unwrap().contains_key(&addr);
                 if is_mine {
-                    if !handle_breakpoint_hit(pid, h, &breakpoints, thread_id, addr, &event_tx, &resume_rx, &stop_rx) {
+                    if !handle_breakpoint_hit(pid, h, &breakpoints, thread_id, addr, &event_tx, &resume_rx, &stop_rx, wow64) {
                         break;
                     }
                     pending_restore = Some(addr);
@@ -385,9 +533,9 @@ fn event_loop(
                     // 加载器断点或未知断点：直接继续。
                     unsafe { let _ = ContinueDebugEvent(pid, thread_id, DBG_CONTINUE); }
                 }
-            } else if code == EXCEPTION_SINGLE_STEP.0 {
+            } else if is_step_code {
                 // 先检查硬件监视点（DR6 bits 0-3）。
-                if let Some(slot) = read_watchpoint_slot(thread_id) {
+                if let Some(slot) = read_watchpoint_slot(thread_id, wow64) {
                     let wp = watchpoints.lock().unwrap()[slot];
                     if let Some(wp) = wp {
                         let access = if wp.on_read && wp.on_write {
@@ -404,11 +552,11 @@ fn event_loop(
                             code: code as u32,
                             access: Some(access.to_string()),
                         });
-                        clear_dr6(thread_id);
+                        clear_dr6(thread_id, wow64);
                         if !wait_resume(&resume_rx, &stop_rx) {
                             break;
                         }
-                        apply_step(&step_requested, thread_id);
+                        apply_step(&step_requested, thread_id, wow64);
                         unsafe { let _ = ContinueDebugEvent(pid, thread_id, DBG_CONTINUE); }
                         continue;
                     }
@@ -421,9 +569,9 @@ fn event_loop(
                         let _ = write_byte(h, bp_addr, INT3);
                     }
                     if let Ok(thread) = open_thread(thread_id) {
-                        if let Ok(mut ctx) = get_context(thread) {
+                        if let Ok(mut ctx) = read_thread_ctx(thread, wow64) {
                             ctx.EFlags &= !TRAP_FLAG;
-                            let _ = set_context(thread, &ctx);
+                            let _ = write_thread_ctx(thread, &ctx, wow64);
                         }
                         unsafe { let _ = CloseHandle(thread); }
                     }
@@ -439,7 +587,7 @@ fn event_loop(
                     if !wait_resume(&resume_rx, &stop_rx) {
                         break;
                     }
-                    apply_step(&step_requested, thread_id);
+                    apply_step(&step_requested, thread_id, wow64);
                     unsafe { let _ = ContinueDebugEvent(pid, thread_id, DBG_CONTINUE); }
                 }
             } else {
@@ -459,7 +607,7 @@ fn event_loop(
                 if !wait_resume(&resume_rx, &stop_rx) {
                     break;
                 }
-                apply_step(&step_requested, thread_id);
+                apply_step(&step_requested, thread_id, wow64);
                 unsafe { let _ = ContinueDebugEvent(pid, thread_id, DBG_EXCEPTION_NOT_HANDLED); }
             }
         } else {
@@ -480,12 +628,13 @@ fn handle_breakpoint_hit(
     event_tx: &Sender<DebugEvent>,
     resume_rx: &Receiver<()>,
     stop_rx: &Receiver<()>,
+    wow64: bool,
 ) -> bool {
     if let Ok(thread) = open_thread(thread_id) {
-        if let Ok(mut ctx) = get_context(thread) {
+        if let Ok(mut ctx) = read_thread_ctx(thread, wow64) {
             ctx.Rip = addr; // 回退到断点指令
             ctx.EFlags |= TRAP_FLAG; // 单步
-            let _ = set_context(thread, &ctx);
+            let _ = write_thread_ctx(thread, &ctx, wow64);
         }
         unsafe { let _ = CloseHandle(thread); }
     }
@@ -523,7 +672,7 @@ fn wait_resume(resume_rx: &Receiver<()>, stop_rx: &Receiver<()>) -> bool {
 
 /// 若单步请求已置位，则在事件循环（调试）线程上对当前线程置 TF。
 /// `SetThreadContext` 对调试目标线程有线程亲和性，必须在此执行。
-fn apply_step(step_requested: &Arc<Mutex<bool>>, thread_id: u32) {
+fn apply_step(step_requested: &Arc<Mutex<bool>>, thread_id: u32, wow64: bool) {
     let mut st = step_requested.lock().unwrap();
     if !*st {
         return;
@@ -532,9 +681,9 @@ fn apply_step(step_requested: &Arc<Mutex<bool>>, thread_id: u32) {
     drop(st);
 
     if let Ok(thread) = open_thread(thread_id) {
-        if let Ok(mut ctx) = get_context(thread) {
+        if let Ok(mut ctx) = read_thread_ctx(thread, wow64) {
             ctx.EFlags |= TRAP_FLAG;
-            let _ = set_context(thread, &ctx);
+            let _ = write_thread_ctx(thread, &ctx, wow64);
         }
         unsafe { let _ = CloseHandle(thread); }
     }
@@ -543,9 +692,9 @@ fn apply_step(step_requested: &Arc<Mutex<bool>>, thread_id: u32) {
 // ---- 硬件监视点辅助 ----
 
 /// 读取线程的 DR6，若 bits 0-3 有置位则返回触发的槽位。
-fn read_watchpoint_slot(thread_id: u32) -> Option<usize> {
+fn read_watchpoint_slot(thread_id: u32, wow64: bool) -> Option<usize> {
     let thread = open_thread(thread_id).ok()?;
-    let ctx = get_context_debug(thread).ok()?;
+    let ctx = read_thread_ctx_debug(thread, wow64).ok()?;
     let _ = unsafe { CloseHandle(thread) };
     let dr6 = ctx.Dr6;
     if dr6 & 0xF != 0 {
@@ -556,11 +705,11 @@ fn read_watchpoint_slot(thread_id: u32) -> Option<usize> {
 }
 
 /// 清除线程的 DR6（写 0）。
-fn clear_dr6(thread_id: u32) {
+fn clear_dr6(thread_id: u32, wow64: bool) {
     if let Ok(thread) = open_thread(thread_id) {
-        if let Ok(mut ctx) = get_context_debug(thread) {
+        if let Ok(mut ctx) = read_thread_ctx_debug(thread, wow64) {
             ctx.Dr6 = 0;
-            let _ = set_context(thread, &ctx);
+            let _ = write_thread_ctx(thread, &ctx, wow64);
         }
         unsafe { let _ = CloseHandle(thread); }
     }
@@ -590,26 +739,26 @@ fn list_threads(pid: u32) -> Vec<u32> {
 }
 
 /// 把监视点应用到进程的所有线程（挂起 → 写 DR → 恢复）。
-fn apply_watchpoints_to_all(pid: u32, wps: &[Option<Watchpoint>; 4]) {
+fn apply_watchpoints_to_all(pid: u32, wps: &[Option<Watchpoint>; 4], wow64: bool) {
     for tid in list_threads(pid) {
-        apply_watchpoints_to_thread(tid, wps);
+        apply_watchpoints_to_thread(tid, wps, wow64);
     }
 }
 
-fn apply_watchpoints_to_thread(thread_id: u32, wps: &[Option<Watchpoint>; 4]) {
+fn apply_watchpoints_to_thread(thread_id: u32, wps: &[Option<Watchpoint>; 4], wow64: bool) {
     let Ok(thread) = open_thread(thread_id) else {
         return;
     };
     unsafe {
         let _ = SuspendThread(thread);
-        if let Ok(mut ctx) = get_context_debug(thread) {
+        if let Ok(mut ctx) = read_thread_ctx_debug(thread, wow64) {
             ctx.Dr0 = wps[0].map(|w| w.address).unwrap_or(0);
             ctx.Dr1 = wps[1].map(|w| w.address).unwrap_or(0);
             ctx.Dr2 = wps[2].map(|w| w.address).unwrap_or(0);
             ctx.Dr3 = wps[3].map(|w| w.address).unwrap_or(0);
             ctx.Dr6 = 0;
             ctx.Dr7 = compute_dr7(wps);
-            let _ = set_context(thread, &ctx);
+            let _ = write_thread_ctx(thread, &ctx, wow64);
         }
         let _ = ResumeThread(thread);
         let _ = CloseHandle(thread);
@@ -640,6 +789,24 @@ fn compute_dr7(wps: &[Option<Watchpoint>; 4]) -> u64 {
 
 // ---- 底层辅助 ----
 
+/// 把 Win32 错误分类为语义化消息（防护：区分受保护 / 不存在 / 已被调试）。
+fn classify_win32(e: &windows::core::Error, action: &str) -> String {
+    let code = (e.code().0 as u32) & 0xFFFF;
+    match code {
+        // ERROR_ACCESS_DENIED：受保护进程（PPL/反作弊）或权限不足。
+        5 => format!(
+            "{action}: access denied (protected process or needs elevation) [win32 0x{code:x}]"
+        ),
+        // ERROR_INVALID_PARAMETER：进程不存在，或已被另一调试器附加。
+        87 => format!(
+            "{action}: invalid parameter (process not found, or already being debugged) [win32 0x{code:x}]"
+        ),
+        // ERROR_INVALID_HANDLE：进程已退出。
+        6 => format!("{action}: invalid handle (process exited) [win32 0x{code:x}]"),
+        _ => format!("{action}: {e} [win32 0x{code:x}]"),
+    }
+}
+
 /// 从目标进程读取 8 字节指针（栈回溯用）。
 fn read_ptr(handle: HANDLE, addr: Address, out: &mut u64) -> bool {
     let mut nread = 0usize;
@@ -665,6 +832,57 @@ fn open_thread(thread_id: u32) -> Result<HANDLE, String> {
         )
         .map_err(|e| format!("OpenThread: {e}"))
     }
+}
+
+/// 统一读取线程上下文：wow64 目标走 WOW64_CONTEXT，其余走 64 位 CONTEXT。
+///
+/// 断点/监视点命中后的短暂窗口内 GetThreadContext 可能报 ERROR_NOACCESS
+/// （线程上下文切换中），做少量重试。
+fn read_thread_ctx(thread: HANDLE, wow64: bool) -> Result<CONTEXT, String> {
+    if wow64 {
+        let w = get_wow64_context(thread)?;
+        return Ok(wow64_to_ctx(&w));
+    }
+    let mut last = String::new();
+    for _ in 0..4 {
+        match get_context(thread) {
+            Ok(ctx) => return Ok(ctx),
+            Err(e) => {
+                last = e;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 统一读取含调试寄存器的线程上下文。
+fn read_thread_ctx_debug(thread: HANDLE, wow64: bool) -> Result<CONTEXT, String> {
+    if wow64 {
+        let w = get_wow64_context(thread)?;
+        return Ok(wow64_to_ctx(&w));
+    }
+    let mut last = String::new();
+    for _ in 0..4 {
+        match get_context_debug(thread) {
+            Ok(ctx) => return Ok(ctx),
+            Err(e) => {
+                last = e;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 统一写入线程上下文。
+fn write_thread_ctx(thread: HANDLE, ctx: &CONTEXT, wow64: bool) -> Result<(), String> {
+    if wow64 {
+        let mut w = get_wow64_context(thread)?;
+        ctx_to_wow64(ctx, &mut w);
+        return set_wow64_context(thread, &w);
+    }
+    set_context(thread, ctx)
 }
 
 fn get_context(thread: HANDLE) -> Result<CONTEXT, String> {

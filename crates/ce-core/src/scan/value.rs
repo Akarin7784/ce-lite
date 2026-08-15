@@ -59,6 +59,28 @@ pub fn equals(bytes: &[u8], vt: ValueType, value: &Value) -> bool {
     }
 }
 
+/// 带掩码的 AOB 匹配：`mask[i] == 0xFF` 时字节必须相等，`0x00` 为通配符（`??`）。
+///
+/// `pattern` 与 `mask` 等长；CE 的 `??` 通配符即此语义。
+pub fn equals_masked(bytes: &[u8], pattern: &[u8], mask: &[u8]) -> bool {
+    if bytes.len() < pattern.len() || mask.len() < pattern.len() {
+        return false;
+    }
+    pattern
+        .iter()
+        .zip(mask.iter())
+        .enumerate()
+        .all(|(i, (p, m))| *m == 0 || bytes[i] == *p)
+}
+
+/// XOR 字节变换（CE XOR 扫描语义）：每个字节与密钥（低 8 位）异或。
+///
+/// 首扫时对原始字节逐字节 XOR 后存储/比较；后续轮直接比较已 XOR 的存储值。
+pub fn xor_bytes(bytes: &[u8], key: i64) -> Vec<u8> {
+    let k = (key & 0xFF) as u8;
+    bytes.iter().map(|b| b ^ k).collect()
+}
+
 /// 值到数值（用于增大/减小/大于/小于等比较）。
 ///
 /// 注意：以 `f64` 近似，`Int64` 超过 2^53 时比较精度下降；

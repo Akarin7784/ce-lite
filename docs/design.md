@@ -94,8 +94,8 @@
 | `memory.regions` | `{}` | `MemoryRegion[]` |
 | `memory.read` | `{ "address": u64, "size": usize }` | `{ "bytes": base64 }` |
 | `memory.write` | `{ "address": u64, "bytes": base64 }` | `{ "written": usize }` |
-| `scan.new` | `{ "value_type": ValueType, "scan_type": ScanType, "value": Value }` | `{ "scan_id": u64, "count": u64 }` |
-| `scan.next` | `{ "scan_id": u64, "scan_type": ScanType, "value": Value }` | `{ "scan_id": u64, "count": u64 }` |
+| `scan.new` | `{ "value_type": ValueType, "scan_type": ScanType, "value": Value, "mask"?, "min"?, "max"?, "xor_key"? }` | `{ "scan_id": u64, "count": u64 }` |
+| `scan.next` | `{ "scan_id": u64, "scan_type": ScanType, "value": Value, "mask"?, "min"?, "max"?, "xor_key"? }` | `{ "scan_id": u64, "count": u64 }` |
 | `scan.results` | `{ "scan_id": u64, "offset": usize, "limit": usize }` | `{ "total": u64, "results": ScanResult[] }` |
 | `scan.close` | `{ "scan_id": u64 }` | `{}` |
 
@@ -117,17 +117,39 @@
 | `thread.inject_dll` | `{ "pid", "path", "timeout_ms"? }` | `{ "thread_id", "completed", "exit_code" }` |
 | `thread.create_remote` | `{ "pid", "code": base64, "arg"?, "timeout_ms"? }` | `{ "thread_id", "completed", "exit_code" }` |
 | `debug.stack` | `{ "thread_id", "max_frames"? }` | `{ "count", "frames": [{ "frame", "rip", "rbp", "rsp", "module"?, "offset"? }] }` |
+| `debug.accessor` | `{ "thread_id" }` | `{ "rip", "registers", "instruction"?, "module"?, "offset"?, "symbol"? }` |
+| `symbols.pdb_resolve` | `{ "address" }` | `{ "address", "name": string? }` |
+| `pointer.analyze` | `{ "scan_id" }` | `{ "top_offsets": [(level, offset, count)], "unions": [{ "offsets", "members" }] }` |
+| `pointer.struct_spawn` | `{ "scan_id" }` | `{ "name", "fields": StructField[] }` |
+| `disasm.xrefs` | `{ "address", "module"?, "limit"? }` | `{ "count", "xrefs": [{ "address", "bytes", "text", "module"?, "offset"? }] }` |
+| `disasm.function` | `{ "address", "max_back"?, "max_len"? }` | `{ "start", "end", "size", "instructions" }` |
+| `module.aob_scan` | `{ "pattern": "DE ?? BE EF", "module"? }` | `{ "count", "hits": Address[] }` |
+| `session.save` | `{}` | `{ "data": base64 }` |
+| `session.load` | `{ "data": base64 }` | `{ "loaded": true }` |
+| `trainer.freeze` | `{ "address", "bytes": base64, "interval_ms"? }` | `{ "freeze_id", "address" }` |
+| `trainer.unfreeze` | `{ "freeze_id" }` | `{ "unfrozen": true }` |
+| `trainer.list` | `{}` | `{ "freezes": [{ "freeze_id", "address", "size", "interval_ms" }] }` |
+| `patch.export` | `{}` | `{ "name", "patch_count", "patches": [{ "address", "original", "bytes" }] }` |
+| `hook.install` | `{ "address", "hook": base64 }` | `{ "installed", "address", "trampoline", "hook_cave", "patch_len" }` |
+| `hook.remove` | `{ "address" }` | `{ "removed" }` |
+| `hook.list` | `{}` | `{ "hooks": [{ "address", "trampoline", "hook_cave", "patch_len" }] }` |
 
 - `AntiCheatInfo`: `{ "name", "process", "pid", "kernel" }`
 - `protect.status` 是**防护而非对抗**：只在附加前探测已知反作弊，不做任何隐藏/绕过。
 - `thread.create_remote` 的 `code` 为 x64 位置无关 shellcode（可用 `asm` 生成），须以 `ret` 结尾；
   线程完成则自动释放远程内存，超时则保留（线程可能仍在运行）。
 - `debug.stack` 为 RBP 链回溯（尽力而为，要求目标开启帧指针）；断点命中后调用。
+- `scan.new` 的 `mask` 为 AOB 通配掩码（255=必须匹配，0=通配）；`min`/`max` 配合 `between`；
+  `xor_key` 启用 XOR 扫描（逐字节异或后比较/存储，CE 语义）。
+- `hook.install` 自动生成 trampoline（原指令 + jmp 回）并在目标处写 `E9 rel32` 跳转到钩子洞。
+- 32 位（Wow64）目标：`process.attach` 按 PE 机器类型判定 `arch`/`pointer_size`；
+  调试器用 `Wow64GetThreadContext/SetThreadContext`（WOW64_CONTEXT），
+  WX86 断点/单步码（0x4000001F/0x4000001E）按断点/单步处理。
 
 ### 领域类型（见 `ce-core/src/types.rs`）
 
 - `ValueType`: `byte | int16 | int32 | int64 | float | double | string | bytes | binary`
-- `ScanType`: `exact | increased | decreased | changed | unchanged | increased_by | decreased_by | bigger_than | smaller_than | between | unknown_initial`
+- `ScanType`: `exact | increased | decreased | changed | unchanged | increased_by | decreased_by | bigger_than | smaller_than | between | rounded | unknown_initial`
 - `Value`: `int | float | double | string | bytes(AOB) | null`
 - `MemoryRegion`: `{ base, size, protection, readable, writable, executable, name? }`
 - `ProcessInfo`: `{ pid, name, arch, pointer_size }`

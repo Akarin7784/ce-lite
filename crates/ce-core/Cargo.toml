@@ -8,7 +8,11 @@ license.workspace = true
 [dependencies]
 goblin = "0.9.3"
 iced-x86 = "1.21.0"
-keystone-engine = "0.1.0"
+rayon = "1.10.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# keystone 的 C 构建脚本无法交叉编译到 Linux 目标，限定在非 Linux 平台。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+keystone-engine = "0.1.0"

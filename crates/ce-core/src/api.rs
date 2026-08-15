@@ -27,6 +27,22 @@ pub mod method {
     pub const POINTER_RESCAN: &str = "pointer.rescan";
     pub const POINTER_RESULTS: &str = "pointer.results";
     pub const POINTER_CLOSE: &str = "pointer.close";
+    pub const POINTER_ANALYZE: &str = "pointer.analyze";
+    pub const POINTER_STRUCT_SPAWN: &str = "pointer.struct_spawn";
+    pub const DISASM_XREFS: &str = "disasm.xrefs";
+    pub const DISASM_FUNCTION: &str = "disasm.function";
+    pub const SYMBOLS_PDB_RESOLVE: &str = "symbols.pdb_resolve";
+    pub const SESSION_SAVE: &str = "session.save";
+    pub const SESSION_LOAD: &str = "session.load";
+    pub const DEBUG_ACCESSOR: &str = "debug.accessor";
+    pub const MODULE_AOB_SCAN: &str = "module.aob_scan";
+    pub const TRAINER_FREEZE: &str = "trainer.freeze";
+    pub const TRAINER_UNFREEZE: &str = "trainer.unfreeze";
+    pub const TRAINER_LIST: &str = "trainer.list";
+    pub const PATCH_EXPORT: &str = "patch.export";
+    pub const HOOK_INSTALL: &str = "hook.install";
+    pub const HOOK_REMOVE: &str = "hook.remove";
+    pub const HOOK_LIST: &str = "hook.list";
     pub const DEBUG_ATTACH: &str = "debug.attach";
     pub const DEBUG_DETACH: &str = "debug.detach";
     pub const DEBUG_BREAKPOINT_SET: &str = "debug.breakpoint_set";
@@ -134,6 +150,18 @@ pub struct ScanNewParams {
     pub scan_type: crate::ScanType,
     #[serde(default)]
     pub value: crate::Value,
+    /// AOB 通配符掩码：0xFF 必须匹配，0x00 通配。
+    #[serde(default)]
+    pub mask: Option<Vec<u8>>,
+    /// `between` 下界（含）。
+    #[serde(default)]
+    pub min: Option<f64>,
+    /// `between` 上界（含）。
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// XOR 扫描密钥。
+    #[serde(default)]
+    pub xor_key: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +170,14 @@ pub struct ScanNextParams {
     pub scan_type: crate::ScanType,
     #[serde(default)]
     pub value: crate::Value,
+    #[serde(default)]
+    pub mask: Option<Vec<u8>>,
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub xor_key: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,4 +338,73 @@ pub struct StackParams {
     /// 回溯的最大帧数（默认 16）。
     #[serde(default)]
     pub max_frames: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScanIdParams2 {
+    pub scan_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisasmXrefsParams {
+    pub address: u64,
+    /// 限定在某个模块内扫描（按名称或路径）；缺省扫全部可执行区域。
+    #[serde(default)]
+    pub module: Option<String>,
+    /// 结果上限（默认 100）。
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisasmFunctionParams {
+    pub address: u64,
+    /// 向前回溯找函数起点的最大字节数（默认 256）。
+    #[serde(default)]
+    pub max_back: Option<usize>,
+    /// 从起点向后反汇编的最大字节数（默认 4096）。
+    #[serde(default)]
+    pub max_len: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PdbResolveParams {
+    pub address: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionLoadParams {
+    /// base64 编码的 `session.save` 产物。
+    pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleAobScanParams {
+    /// AOB 模式串（CE 风格），如 `"DE ?? BE EF"`（`??` 为通配符）。
+    pub pattern: String,
+    /// 限定模块（按名称或路径）；缺省扫全部可读区域。
+    #[serde(default)]
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrainerFreezeParams {
+    pub address: u64,
+    /// base64 编码的待写回字节。
+    pub bytes: String,
+    /// 写回间隔毫秒（默认 16）。
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrainerIdParams {
+    pub freeze_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HookInstallParams {
+    pub address: u64,
+    /// base64 编码的钩子代码（x64，以 `ret` 结尾）。
+    pub hook: String,
 }

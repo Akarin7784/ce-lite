@@ -115,18 +115,35 @@ return {
 
     // ---- 工具注册 ----
     const disposers = []
-    function addTool(name, description, parameters, execute) {
+    function addTool(name, description, parameters, execute, render) {
       const def = harness.defineTool({
         name,
         description,
         parameters,
         output: {
           schema: { type: 'json' },
-          render: (args, value) => [{ type: 'text', text: JSON.stringify(value ?? null) }],
+          render: render || ((args, value) => [{ type: 'text', text: JSON.stringify(value ?? null) }]),
         },
         execute,
       })
       disposers.push(harness.registerTool(ctx, def))
+    }
+
+    // 十六进制转储渲染（地址 + hex + ASCII 侧栏）。
+    function hexdump(bytes, base) {
+      const lines = []
+      for (let i = 0; i < bytes.length; i += 16) {
+        const chunk = bytes.slice(i, i + 16)
+        const hex = chunk.map((b) => (b < 16 ? '0' : '') + b.toString(16)).join(' ')
+        const ascii = chunk.map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('')
+        const addr = (base + i).toString(16).padStart(8, '0')
+        lines.push(addr + '  ' + hex.padEnd(47) + '  ' + ascii)
+      }
+      return lines.join('\n')
+    }
+    const hexRender = (args, value) => {
+      if (value === null || value === undefined || !value.bytes) return [{ type: 'text', text: JSON.stringify(value ?? null) }]
+      return [{ type: 'text', text: 'address=0x' + value.address.toString(16) + ' size=' + value.bytes.length + '\n' + hexdump(value.bytes, value.address) }]
     }
 
     addTool('ce_process_list', 'List all processes on this machine (pid + name) for choosing a scan target.', {},
@@ -143,7 +160,7 @@ return {
     addTool('ce_regions', 'List readable/writable/executable memory regions of the attached process.', {},
       async () => rpc('memory.regions', {}))
 
-    addTool('ce_read', 'Read memory from the attached process; returns bytes as a decimal array and hex string.',
+    addTool('ce_read', 'Read memory from the attached process; renders as a hex dump with ASCII sidebar.',
       {
         address: { type: 'number', description: 'Absolute address', required: true },
         size: { type: 'integer', description: 'Bytes to read', required: true },
@@ -152,7 +169,8 @@ return {
         const r = await rpc('memory.read', { address: args.address, size: args.size })
         const bytes = b64ToBytes(r.bytes)
         return { address: args.address, size: bytes.length, hex: toHex(bytes), bytes }
-      })
+      },
+      hexRender)
 
     addTool('ce_write', 'Write bytes into the attached process memory (bytes as a decimal array 0-255).',
       {
@@ -176,21 +194,35 @@ return {
       { snapshot_id: { type: 'integer', description: 'snapshot_id from ce_memory_snapshot', required: true } },
       async (args) => rpc('memory.diff', { snapshot_id: args.snapshot_id }))
 
-    addTool('ce_scan_new', 'Start a memory scan (first scan). Returns scan_id for follow-ups.',
+    addTool('ce_scan_new', 'Start a memory scan (first scan). Returns scan_id for follow-ups. Advanced: mask (AOB wildcards), min/max (between), xor_key (XOR scan).',
       {
         value_type: { type: 'string', description: 'byte|int16|int32|int64|float|double|string|bytes|binary', required: true },
-        scan_type: { type: 'string', description: 'exact|increased|decreased|changed|unchanged|increased_by|decreased_by|bigger_than|smaller_than|unknown_initial', required: true },
+        scan_type: { type: 'string', description: 'exact|increased|decreased|changed|unchanged|increased_by|decreased_by|bigger_than|smaller_than|between|rounded|unknown_initial', required: true },
         value: { type: 'json', description: 'Comparison value: number, string, byte array (AOB), or null' },
+        mask: { type: 'json', description: 'AOB wildcard mask: 255=must match, 0=wildcard (same length as value)' },
+        min: { type: 'number', description: 'between scan lower bound (inclusive)' },
+        max: { type: 'number', description: 'between scan upper bound (inclusive)' },
+        xor_key: { type: 'integer', description: 'XOR scan key: bytes are XORed with this before comparing' },
       },
-      async (args) => rpc('scan.new', { value_type: args.value_type, scan_type: args.scan_type, value: args.value ?? null }))
+      async (args) => rpc('scan.new', {
+        value_type: args.value_type, scan_type: args.scan_type, value: args.value ?? null,
+        mask: args.mask ?? null, min: args.min ?? null, max: args.max ?? null, xor_key: args.xor_key ?? null,
+      }))
 
     addTool('ce_scan_next', 'Narrow a scan (follow-up); re-reads candidates and filters.',
       {
         scan_id: { type: 'integer', description: 'scan_id from ce_scan_new/ce_scan_next', required: true },
-        scan_type: { type: 'string', description: 'exact|changed|unchanged|increased|decreased|increased_by|decreased_by|bigger_than|smaller_than', required: true },
+        scan_type: { type: 'string', description: 'exact|changed|unchanged|increased|decreased|increased_by|decreased_by|bigger_than|smaller_than|between|rounded', required: true },
         value: { type: 'json', description: 'Comparison value (number/string/bytes/null)' },
+        mask: { type: 'json', description: 'AOB wildcard mask (with bytes value)' },
+        min: { type: 'number', description: 'between lower bound' },
+        max: { type: 'number', description: 'between upper bound' },
+        xor_key: { type: 'integer', description: 'XOR key' },
       },
-      async (args) => rpc('scan.next', { scan_id: args.scan_id, scan_type: args.scan_type, value: args.value ?? null }))
+      async (args) => rpc('scan.next', {
+        scan_id: args.scan_id, scan_type: args.scan_type, value: args.value ?? null,
+        mask: args.mask ?? null, min: args.min ?? null, max: args.max ?? null, xor_key: args.xor_key ?? null,
+      }))
 
     addTool('ce_scan_results', 'Read paginated results of a scan.',
       {
@@ -211,6 +243,22 @@ return {
       },
       async (args) => rpc('disasm', { address: args.address, length: args.length }))
 
+    addTool('ce_disasm_xrefs', 'Find all direct CALL instructions targeting an address ("who calls this function"). Scans executable regions.',
+      {
+        address: { type: 'number', description: 'Target address', required: true },
+        module: { type: 'string', description: 'Optional module name/path to limit the scan' },
+        limit: { type: 'integer', description: 'Max results (default 100)' },
+      },
+      async (args) => rpc('disasm.xrefs', { address: args.address, module: args.module ?? null, limit: args.limit ?? 100 }))
+
+    addTool('ce_disasm_function', 'Identify a function boundary around an address: walks back to the prologue and forward to ret.',
+      {
+        address: { type: 'number', description: 'Address inside the function', required: true },
+        max_back: { type: 'integer', description: 'Bytes to walk back looking for the start (default 256)' },
+        max_len: { type: 'integer', description: 'Max bytes to disassemble forward (default 4096)' },
+      },
+      async (args) => rpc('disasm.function', { address: args.address, max_back: args.max_back ?? 256, max_len: args.max_len ?? 4096 }))
+
     addTool('ce_asm', 'Assemble x64 NASM-syntax code into machine bytes (mnemonic to bytes).',
       { code: { type: 'string', description: 'Assembly code, e.g. "mov eax, 0x10; ret"', required: true } },
       async (args) => rpc('asm', { code: args.code }))
@@ -218,6 +266,17 @@ return {
     addTool('ce_symbols_resolve', 'Resolve an exported symbol name (e.g. "WriteFile") to an address.',
       { name: { type: 'string', description: 'Export name', required: true } },
       async (args) => rpc('symbols.resolve', { name: args.name }))
+
+    addTool('ce_symbols_pdb_resolve', 'Resolve an address to a function name via PDB/DbgHelp symbols (name may be null if no PDB).',
+      { address: { type: 'number', description: 'Absolute address', required: true } },
+      async (args) => rpc('symbols.pdb_resolve', { address: args.address }))
+
+    addTool('ce_module_aob_scan', 'Scan for an AOB byte pattern with ? wildcards (CE style, e.g. "DE ?? BE EF") across readable memory or one module.',
+      {
+        pattern: { type: 'string', description: 'Pattern string, e.g. "DE ?? BE EF"', required: true },
+        module: { type: 'string', description: 'Optional module name/path to limit the search' },
+      },
+      async (args) => rpc('module.aob_scan', { pattern: args.pattern, module: args.module ?? null }))
 
     addTool('ce_struct_define', 'Define a structure (named fields with type+offset) for interpreting memory.',
       {
@@ -239,6 +298,14 @@ return {
     addTool('ce_struct_delete', 'Delete a defined structure.',
       { name: { type: 'string', description: 'Structure name', required: true } },
       async (args) => rpc('struct.delete', { name: args.name }))
+
+    addTool('ce_session_save', 'Export the whole analysis session (structs, pointer chains, patches, freezes, hooks) as a base64 blob for later ce_session_load.',
+      {},
+      async () => rpc('session.save', {}))
+
+    addTool('ce_session_load', 'Restore a previously saved session (base64 from ce_session_save).',
+      { data: { type: 'string', description: 'base64 session blob from ce_session_save', required: true } },
+      async (args) => rpc('session.load', { data: args.data }))
 
     addTool('ce_pointer_scan', 'Pointer scan: find multi-level pointer chains leading to a value address; static pointers resolve to module+offset.',
       {
@@ -283,6 +350,14 @@ return {
     addTool('ce_pointer_close', 'Free a pointer scan session.',
       { scan_id: { type: 'integer', description: 'scan_id', required: true } },
       async (args) => rpc('pointer.close', { scan_id: args.scan_id }))
+
+    addTool('ce_pointer_analyze', 'Analyze a pointer scan: offset clustering (most frequent struct offsets) and union grouping (chains sharing the same offset path).',
+      { scan_id: { type: 'integer', description: 'scan_id', required: true } },
+      async (args) => rpc('pointer.analyze', { scan_id: args.scan_id }))
+
+    addTool('ce_pointer_struct_spawn', 'Generate candidate structure fields from a pointer scan (structure spawn): deduped offsets as int64 fields for struct.define.',
+      { scan_id: { type: 'integer', description: 'scan_id', required: true } },
+      async (args) => rpc('pointer.struct_spawn', { scan_id: args.scan_id }))
 
     addTool('ce_debug_attach', 'Attach the debugger to a process (software breakpoints + register read).',
       { pid: { type: 'integer', description: 'Process id', required: true } },
@@ -346,6 +421,10 @@ return {
       },
       async (args) => rpc('debug.stack', { thread_id: args.thread_id, max_frames: args.max_frames ?? 16 }))
 
+    addTool('ce_debug_accessor', 'Accessor closure: at a breakpoint/watchpoint, report the instruction at RIP with module+offset+symbol and registers ("who is accessing this address").',
+      { thread_id: { type: 'integer', description: 'Thread id from a debug event', required: true } },
+      async (args) => rpc('debug.accessor', { thread_id: args.thread_id }))
+
     addTool('ce_thread_inject_dll', 'Inject a DLL into a process: remote thread runs LoadLibraryW(path) in the target. Returns thread_id, completed, exit_code.',
       {
         pid: { type: 'integer', description: 'Process id', required: true },
@@ -364,6 +443,39 @@ return {
       async (args) => {
         return rpc('thread.create_remote', { pid: args.pid, code: bytesToB64(args.code), arg: args.arg ?? 0, timeout_ms: args.timeout_ms ?? 10000 })
       })
+
+    addTool('ce_trainer_freeze', 'Freeze a memory value: a background thread writes the given bytes to the address every interval_ms (trainer-style value lock).',
+      {
+        address: { type: 'number', description: 'Address to keep writing', required: true },
+        bytes: { type: 'array', items: { type: 'integer' }, description: 'Bytes to write back repeatedly (decimal 0-255)', required: true },
+        interval_ms: { type: 'integer', description: 'Write interval in ms (default 16)' },
+      },
+      async (args) => rpc('trainer.freeze', { address: args.address, bytes: bytesToB64(args.bytes), interval_ms: args.interval_ms ?? 16 }))
+
+    addTool('ce_trainer_unfreeze', 'Stop a freeze job.',
+      { freeze_id: { type: 'integer', description: 'freeze_id from ce_trainer_freeze', required: true } },
+      async (args) => rpc('trainer.unfreeze', { freeze_id: args.freeze_id }))
+
+    addTool('ce_trainer_list', 'List active freeze jobs.', {},
+      async () => rpc('trainer.list', {}))
+
+    addTool('ce_patch_export', 'Export all memory writes as a patch list (address, original bytes, new bytes) — a .CT-style JSON for replay/rollback.',
+      {},
+      async () => rpc('patch.export', {}))
+
+    addTool('ce_hook_install', 'Install an inline hook: jmp at target to your hook code (built with ce_asm), with a trampoline carrying the original bytes + jmp-back. Returns trampoline address.',
+      {
+        address: { type: 'number', description: 'Target code address', required: true },
+        hook: { type: 'array', items: { type: 'integer' }, description: 'Hook code bytes (decimal 0-255), must end with ret', required: true },
+      },
+      async (args) => rpc('hook.install', { address: args.address, hook: bytesToB64(args.hook) }))
+
+    addTool('ce_hook_remove', 'Remove an inline hook (restore original bytes from the trampoline).',
+      { address: { type: 'number', description: 'Target code address', required: true } },
+      async (args) => rpc('hook.remove', { address: args.address }))
+
+    addTool('ce_hook_list', 'List installed hooks.', {},
+      async () => rpc('hook.list', {}))
 
     // ---- 清理 ----
     ctx.effect(() => () => {

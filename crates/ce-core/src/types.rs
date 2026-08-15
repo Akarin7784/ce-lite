@@ -86,6 +86,8 @@ pub enum ScanType {
     BiggerThan,
     SmallerThan,
     Between,
+    /// 浮点四舍五入后比较（CE 的 rounded 扫描）。
+    Rounded,
     UnknownInitial,
 }
 
@@ -125,6 +127,15 @@ pub struct DisasmResult {
     pub address: Address,
     pub bytes: Vec<u8>,
     pub text: String,
+}
+
+/// 函数边界识别结果（尽力而为）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionInfo {
+    pub start: Address,
+    pub end: Address,
+    pub size: usize,
+    pub instructions: Vec<DisasmResult>,
 }
 
 /// 一条符号记录（模块导出/导入）。
@@ -242,4 +253,21 @@ pub struct StackFrame {
     pub rip: u64,
     pub rbp: u64,
     pub rsp: u64,
+}
+
+/// 指针链分析结果（union 合并 + 偏移聚类）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerAnalysis {
+    /// 各级偏移频次 `(level, offset, count)`，按频次降序。
+    pub top_offsets: Vec<(usize, u32, usize)>,
+    /// union 分组：偏移路径相同的链合并为一组（不同基址的同一逻辑指针）。
+    pub unions: Vec<PointerUnion>,
+}
+
+/// 一个指针 union：偏移路径 + 成员链数量。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerUnion {
+    /// 该组的偏移路径（level 0 最近目标）。
+    pub offsets: Vec<u32>,
+    pub members: usize,
 }

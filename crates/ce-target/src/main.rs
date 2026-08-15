@@ -8,6 +8,22 @@ fn tick() {
     std::hint::black_box(0u64);
 }
 
+/// CRC32（简单实现，供自校验测试）。
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFFFFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 fn main() {
     let mut data = vec![0u8; 0x2000];
     // x64 分配器返回 8 字节对齐指针，保证 4 字节扫描网格能命中这些偏移。
@@ -15,6 +31,12 @@ fn main() {
     data[0x14..0x18].copy_from_slice(&200i32.to_le_bytes()); // 值 200
     data[0x100..0x108].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]); // AOB
     data[0x200..0x204].copy_from_slice(&777i32.to_le_bytes()); // 值 777
+    // 高级扫描靶子：
+    // 0x600: 逐字节 XOR 0x55 存储的 777（XOR 扫描）
+    data[0x600..0x604]
+        .copy_from_slice(&777i32.to_le_bytes().iter().map(|b| b ^ 0x55).collect::<Vec<u8>>());
+    data[0x700..0x704].copy_from_slice(&99.6f32.to_le_bytes()); // 四舍五入 = 100（rounded）
+    data[0x800..0x804].copy_from_slice(&150i32.to_le_bytes()); // 介于 [100,200]（between）
 
     let ptr = data.as_ptr() as u64;
     // 指针链（供 pointer.scan 测试）：
@@ -52,6 +74,42 @@ fn main() {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    });
+
+    // 后台线程：CRC 自校验 tick 函数字节（若被 INT3 补丁，CRC 会变化），每 50ms 更新。
+    let crc_addr = ptr + 0x500;
+    let tick_bytes: Vec<u8> = unsafe {
+        std::slice::from_raw_parts(tick_addr as *const u8, 64).to_vec()
+    };
+    std::thread::spawn(move || {
+        loop {
+            let crc = crc32(&tick_bytes);
+            unsafe {
+                *(crc_addr as *mut u32) = crc;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    // 竞争值：4 个线程递增（多线程竞争测试靶子；1ms 节流避免烧满 CPU）。
+    let contended = ptr + 0x900;
+    for _ in 0..4 {
+        let c = contended;
+        std::thread::spawn(move || loop {
+            unsafe {
+                let v = *(c as *mut i32);
+                *(c as *mut i32) = v.wrapping_add(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        });
+    }
+
+    // 动态内存：周期分配/释放 64KB（动态布局测试靶子）。
+    std::thread::spawn(move || loop {
+        let buf = vec![0xABu8; 0x10000];
+        std::hint::black_box(buf.as_ptr());
+        drop(buf);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     // 主循环反复调用 tick（供断点测试命中），保持进程存活。

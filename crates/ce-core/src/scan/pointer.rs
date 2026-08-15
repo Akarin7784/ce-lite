@@ -9,8 +9,10 @@
 //!    内但不指向有效内存的情况被剔除）。
 //! 2. **二次快照**：`chain_stable` 重读每条链各跳的值，只有值不变的才是真指针。
 
+use std::collections::{HashMap, HashSet};
+
 use super::ScanMemory;
-use crate::{Address, MemoryRegion, PointerHop};
+use crate::{Address, MemoryRegion, PointerHop, PointerAnalysis, PointerUnion, StructField};
 
 /// 在可读且非代码的内存区域中，找出指向 `target`（允许 `[target - max_offset, target]`
 /// 区间，即带结构体偏移）的指针，并做静态去噪（指针值必须指向有效内存）。
@@ -135,6 +137,81 @@ fn read_little_endian(buf: &[u8]) -> u64 {
     v
 }
 
+// ---- 指针链分析（union 合并 + 偏移聚类 + structure spawn） ----
+
+/// 链的偏移路径签名（各跳 offset，不含指针地址）。
+fn offset_path(chain: &[PointerHop]) -> Vec<u32> {
+    chain.iter().map(|h| h.offset).collect()
+}
+
+/// 统计各级偏移频次 `(level, offset, count)`，按频次降序、level/offset 升序。
+///
+/// 高频偏移 = 结构体中最可能的字段位置（CE 偏移聚类）。
+pub fn top_offsets(chains: &[Vec<PointerHop>], max: usize) -> Vec<(usize, u32, usize)> {
+    let mut counts: HashMap<(usize, u32), usize> = HashMap::new();
+    for chain in chains {
+        for (level, hop) in chain.iter().enumerate() {
+            *counts.entry((level, hop.offset)).or_insert(0) += 1;
+        }
+    }
+    let mut v: Vec<(usize, u32, usize)> = counts
+        .into_iter()
+        .map(|((l, o), c)| (l, o, c))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    v.truncate(max);
+    v
+}
+
+/// union 合并：偏移路径相同的链归为一组（不同基址的同一逻辑指针）。
+pub fn unions(chains: &[Vec<PointerHop>]) -> Vec<PointerUnion> {
+    let mut groups: HashMap<Vec<u32>, usize> = HashMap::new();
+    for chain in chains {
+        *groups.entry(offset_path(chain)).or_insert(0) += 1;
+    }
+    let mut v: Vec<PointerUnion> = groups
+        .into_iter()
+        .map(|(offsets, members)| PointerUnion { offsets, members })
+        .collect();
+    v.sort_by(|a, b| {
+        b.members
+            .cmp(&a.members)
+            .then(a.offsets.len().cmp(&b.offsets.len()))
+    });
+    v
+}
+
+/// 一键分析：偏移聚类 + union 分组。
+pub fn analyze(chains: &[Vec<PointerHop>]) -> PointerAnalysis {
+    PointerAnalysis {
+        top_offsets: top_offsets(chains, 32),
+        unions: unions(chains),
+    }
+}
+
+/// structure spawn：从链集生成候选结构体字段。
+///
+/// 收集链中出现的全部偏移（去重）为字段，类型 `int64`；
+/// AI 可在此基础上用 `struct.define` 精化类型与名称。
+pub fn struct_spawn(chains: &[Vec<PointerHop>]) -> Vec<StructField> {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut fields: Vec<StructField> = Vec::new();
+    for chain in chains {
+        for hop in chain {
+            if seen.insert(hop.offset) {
+                fields.push(StructField {
+                    name: format!("field_{:#x}", hop.offset),
+                    value_type: crate::ValueType::Int64,
+                    offset: hop.offset,
+                    size: None,
+                });
+            }
+        }
+    }
+    fields.sort_by_key(|f| f.offset);
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +332,45 @@ mod tests {
 
         assert!(chain_stable(&mem, &real, target, 8)); // 真指针仍稳定
         assert!(!chain_stable(&mem, &decoy, target, 8)); // 假指针被过滤
+    }
+
+    #[test]
+    fn analyze_clusters_offsets_and_unions() {
+        // 三条链：两条偏移路径相同（union 成员 2），一条不同。
+        let c1 = vec![
+            PointerHop { pointer_address: 0x1000, offset: 0x10 },
+            PointerHop { pointer_address: 0x2000, offset: 0x20 },
+        ];
+        let c2 = vec![
+            PointerHop { pointer_address: 0x1008, offset: 0x10 },
+            PointerHop { pointer_address: 0x2008, offset: 0x20 },
+        ];
+        let c3 = vec![PointerHop { pointer_address: 0x1010, offset: 0x30 }];
+        let chains = vec![c1, c2, c3];
+
+        let analysis = analyze(&chains);
+        // 偏移频次：level0/0x10 ×2、level1/0x20 ×2、level0/0x30 ×1
+        assert_eq!(analysis.top_offsets[0], (0, 0x10, 2));
+        assert_eq!(analysis.top_offsets[1], (1, 0x20, 2));
+        // union：路径 [0x10,0x20] 成员 2 排最前
+        assert_eq!(analysis.unions[0].offsets, vec![0x10, 0x20]);
+        assert_eq!(analysis.unions[0].members, 2);
+        assert_eq!(analysis.unions[1].offsets, vec![0x30]);
+        assert_eq!(analysis.unions[1].members, 1);
+    }
+
+    #[test]
+    fn struct_spawn_dedups_offsets() {
+        let chains = vec![
+            vec![
+                PointerHop { pointer_address: 0x1000, offset: 0x10 },
+                PointerHop { pointer_address: 0x2000, offset: 0x20 },
+            ],
+            vec![PointerHop { pointer_address: 0x3000, offset: 0x10 }],
+        ];
+        let fields = struct_spawn(&chains);
+        let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
+        assert_eq!(offsets, vec![0x10, 0x20]);
+        assert!(fields.iter().all(|f| f.value_type == crate::ValueType::Int64));
     }
 }

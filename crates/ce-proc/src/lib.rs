@@ -10,6 +10,9 @@ pub mod winproc;
 #[cfg(target_os = "windows")]
 pub mod debug;
 
+#[cfg(target_os = "windows")]
+pub mod pdb;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
@@ -17,6 +20,12 @@ pub use process::{list_processes, open, Process, ProcessError};
 
 #[cfg(target_os = "windows")]
 pub use winproc::{create_remote, detect_anti_cheats, inject_dll};
+
+/// 平台调试器统一导出（ce-serve 通过 `ce_proc::Debugger` 使用，无需平台判断）。
+#[cfg(target_os = "windows")]
+pub use debug::Debugger;
+#[cfg(target_os = "linux")]
+pub use linux::Debugger;
 
 /// 桥接：任何 `dyn Process`（任意对象生命周期）都可作为 `ce-core` 扫描器的内存源。
 impl<'a> ce_core::scan::ScanMemory for dyn Process + 'a {

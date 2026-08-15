@@ -22,7 +22,10 @@ pub enum ProcessError {
 }
 
 /// 跨进程访问的统一抽象。
-pub trait Process {
+///
+/// `Send + Sync`：扫描/分析可能在 rayon 工作线程上并发访问同一个进程句柄；
+/// Windows/Linux 的内存读写 API 均支持并发调用。
+pub trait Process: Send + Sync {
     fn pid(&self) -> u32;
     fn info(&self) -> ProcessInfo;
     /// 枚举可读内存区域（`VirtualQueryEx` / `/proc/PID/maps`）。
@@ -36,6 +39,12 @@ pub trait Process {
     /// 枚举目标进程已加载模块（主模块 + DLL）。默认空；平台后端覆盖。
     fn modules(&self) -> Result<Vec<ModuleInfo>, ProcessError> {
         Ok(Vec::new())
+    }
+
+    /// 平台原生进程句柄（Windows：HANDLE；供 PDB 符号引擎等原生能力使用）。
+    #[cfg(target_os = "windows")]
+    fn raw_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        None
     }
 }
 

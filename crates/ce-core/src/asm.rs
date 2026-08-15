@@ -2,12 +2,17 @@
 //!
 //! 纯功能、平台无关（keystone 在构建时从源码编译进本 crate）。
 //! 对应 Cheat Engine 的 `Assemblerunit.pas`，但用 keystone 替代手写汇编器。
+//!
+//! Linux 交叉目标不编译 keystone（其 C 构建脚本无法交叉编译），`assemble`
+//! 在 Linux 上返回明确的"不支持"错误；AI 可改用手写字节补丁。
 
+#[cfg(not(target_os = "linux"))]
 use keystone_engine::{Arch, Keystone, Mode, OptionType, OptionValue};
 
 /// 把 NASM 语法的汇编代码编码为机器码字节。
 ///
 /// `bitness` 取 32 或 64。
+#[cfg(not(target_os = "linux"))]
 pub fn assemble(code: &str, bitness: u32) -> Result<Vec<u8>, String> {
     let mode = if bitness == 64 {
         Mode::MODE_64
@@ -22,6 +27,12 @@ pub fn assemble(code: &str, bitness: u32) -> Result<Vec<u8>, String> {
         .asm(code.to_string(), 0)
         .map_err(|e| format!("assemble failed: {e}"))?;
     Ok(output.bytes)
+}
+
+/// Linux 目标：keystone 不参与交叉编译，返回明确的平台限制错误。
+#[cfg(target_os = "linux")]
+pub fn assemble(_code: &str, _bitness: u32) -> Result<Vec<u8>, String> {
+    Err("asm not supported on linux (keystone not cross-compiled)".to_string())
 }
 
 #[cfg(test)]
