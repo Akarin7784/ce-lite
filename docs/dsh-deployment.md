@@ -1,11 +1,15 @@
 # DSH 插件部署指南（安装 / 启动 / 更新 / 故障恢复）
 
-ce-lite 以 **DSH 动态插件**的形式集成到 DeepSeek Harness：插件在 DSH 会话进程内
-运行，派生 `ce-serve.exe` 子进程并通过 stdio JSON-RPC 通信，把 ce-lite 的全部
-能力注册为模型可调用的 `ce_*` 工具。
+ce-lite 有两种 DSH 集成形态：
 
-> ⚠️ **动态插件不持久**：插件定义只存在于当前 DSH 进程内，**DSH 重启后全部丢失**。
-> 本指南即用于重启后快速恢复，以及日常更新/停止插件。
+- **会话动态插件**（默认）：插件在 DSH 会话进程内运行，派生 `ce-serve.exe` 子进程
+  并通过 stdio JSON-RPC 通信，把 ce-lite 的能力注册为模型可调用的 `ce_*` 工具。
+  ⚠️ 不持久：DSH 重启后定义丢失，需重新部署（第 1-4 节）。
+- **宿主级插件**（推荐，所有会话共享）：作为 host composition 的一行常驻，
+  任何会话（含新开的）开箱即用，**不随 DSH 会话/重启丢失**，且 patch 文件变更会
+  **热重载、无需重启 DSH**（第 5 节）。
+
+> 本机已启用宿主级方案（`celit-1` 动态插件已停用并删除）。
 
 ## 0. 前置条件
 
@@ -66,7 +70,48 @@ cordis_run(pluginId="celit-1", packageId=<当前包>, mode="run")
 - **永久删除**（清空定义、包、授权）：`cordis_undefine(pluginId)`。删除后 `pluginId` 失效，
   只能重新走第 1 步安装。
 
-## 5. 故障排查
+## 5. 宿主级插件（推荐：所有会话共享，热重载）
+
+把 ce-lite 挂进 DSH 的 **host composition**（宿主组合），工具对所有会话可见、
+不随会话/DSH 重启丢失。本机已启用（`~/.dsh/profiles/web/`）。
+
+### 5.1 文件
+
+| 文件 | 作用 |
+|---|---|
+| `~/.dsh/profiles/web/ce-lite-plugin.mjs` | 宿主插件本体（ESM：`name`/`inject`/`apply`，经 `ctx.tools.register` 注册 55 个工具）。仓库权威副本：`dsh/ce-lite-host-plugin.mjs` |
+| `~/.dsh/profiles/web/cordis.patch.yml` | profile 的 patch 层，`insert` 一行挂载插件 |
+
+### 5.2 挂载（一次性）
+
+在 `cordis.patch.yml` 的数组末尾追加：
+
+```yaml
+- insert:
+    - id: ce-lite
+      name: ./ce-lite-plugin.mjs
+```
+
+DSH 通过 `watchUserPatches` 监视该文件——**保存即热重载，无需重启**。
+验证：进程列表出现 `ce-serve.exe`（宿主派生的）；任意会话工具列表出现 `ce_*` 工具。
+
+### 5.3 更新插件代码
+
+1. 改 `ce-lite-plugin.mjs`（或先更新仓库 `dsh/ce-lite-host-plugin.mjs` 再拷贝）；
+2. 保存后 HMR 重新加载插件：旧子进程被终止、新 apply 派生新 ce-serve（工具先反注册再注册）。
+   注意重建 `ce-serve.exe` 前旧子进程可能占用二进制——先等 HMR 完成或手动结束旧进程。
+
+### 5.4 停用 / 回滚
+
+- **停用**：删除（或注释）patch 里的 `insert` 块，保存 → 热重载卸载插件、终止 ce-serve。
+- **完整移除**：同时删除 `ce-lite-plugin.mjs`。
+
+### 5.5 与其他会话 / 动态插件的关系
+
+- 宿主工具注册在**全局层**；会话级工具（如动态插件注册的同名工具）会 shadow 全局，不冲突。
+- 启用宿主版后，会话动态插件即可停用删除（`cordis_stop` + `cordis_undefine`），避免双份 ce-serve。
+
+## 6. 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
@@ -76,15 +121,15 @@ cordis_run(pluginId="celit-1", packageId=<当前包>, mode="run")
 | 插件启动但工具调用报错 | 检查 ce-serve 是否为新二进制（重建后需重启插件，见第 3 步）；确认目标进程存在且权限足够 |
 | 换机器 / 换目录 | `CEEXE` 绝对路径硬编码在 `dsh/celit-plugin.js`（`C:\Users\xueze\...`）→ 更新存档中的路径后重新部署 |
 
-## 6. 工作原理（简要）
+## 7. 工作原理（简要）
 
 ```
-DSH 会话进程（动态插件，进程内）
-  └─ apply(ctx)
-       ├─ ctx.get('subprocess').spawn(ce-serve.exe)   # 持久 stdio 子进程
+DSH 宿主进程（宿主插件，常驻）
+  └─ apply(ctx)  [inject: tools, subprocess]
+       ├─ ctx.subprocess.spawn(ce-serve.exe)          # 持久 stdio 子进程（跨会话共享）
        ├─ stdout 行分隔 JSON-RPC 请求/响应关联（pending Map）
-       ├─ harness.defineTool + registerTool 注册 55 个 ce_* 工具
-       └─ ctx.effect：插件停止时 terminate 子进程 + 反注册工具
+       ├─ defineTool() + ctx.tools.register() 注册 55 个 ce_* 工具
+       └─ ctx.effect：插件卸载时 terminate 子进程 + 反注册工具
 ```
 
 - 工具层做 base64/字节数组转换、hexdump 渲染；方法名直接对应 ce-serve 的 JSON-RPC 方法

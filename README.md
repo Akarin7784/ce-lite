@@ -93,13 +93,14 @@ pwsh -File scripts/smoke-test.ps1                                    # M1+M2 跨
 
 ## DeepSeek Harness 集成
 
-ce-lite 已封装为一个 DSH 动态插件（Host 半区），把 ce-serve 的能力暴露为
-模型可调用的 55 个工具。源码存档在 `dsh/celit-plugin.js`。
+ce-lite 已封装为一个 DSH 插件（Host 半区），把 ce-serve 的能力暴露为
+模型可调用的 55 个工具。**推荐宿主级部署**（所有会话共享、热重载、不随重启丢失，
+文件 `~/.dsh/profiles/web/ce-lite-plugin.mjs`，仓库副本 `dsh/ce-lite-host-plugin.mjs`）；
+会话动态插件（`dsh/celit-plugin.js`）作为备选。
 
 > 📦 **安装 / 启动 / 更新 / 故障恢复**：完整步骤见 [docs/dsh-deployment.md](docs/dsh-deployment.md)。
-> 一句话版：构建 `ce-serve.exe` → 在 DSH 会话中让模型执行
-> `cordis_define`（提交 `dsh/celit-plugin.js` 源码）+ `cordis_run`。
-> 动态插件不随 DSH 重启保留，重启后需重新部署。
+> 宿主版一句话：把 `dsh/ce-lite-host-plugin.mjs` 拷到 profile 目录，并在
+> `cordis.patch.yml` 里 `insert` 一行（保存即热重载）。
 
 - 插件 ID：`celit-1`（动态插件不随 DSH 重启保留；重启后需用存档重新 `cordis_define`+`cordis_run` 部署）
 - 行为：`apply()` 派生 `ce-serve.exe`，在 stdio 上做 JSON-RPC 关联，注册工具
