@@ -96,6 +96,11 @@ pwsh -File scripts/smoke-test.ps1                                    # M1+M2 跨
 ce-lite 已封装为一个 DSH 动态插件（Host 半区），把 ce-serve 的能力暴露为
 模型可调用的 55 个工具。源码存档在 `dsh/celit-plugin.js`。
 
+> 📦 **安装 / 启动 / 更新 / 故障恢复**：完整步骤见 [docs/dsh-deployment.md](docs/dsh-deployment.md)。
+> 一句话版：构建 `ce-serve.exe` → 在 DSH 会话中让模型执行
+> `cordis_define`（提交 `dsh/celit-plugin.js` 源码）+ `cordis_run`。
+> 动态插件不随 DSH 重启保留，重启后需重新部署。
+
 - 插件 ID：`celit-1`（动态插件不随 DSH 重启保留；重启后需用存档重新 `cordis_define`+`cordis_run` 部署）
 - 行为：`apply()` 派生 `ce-serve.exe`，在 stdio 上做 JSON-RPC 关联，注册工具
 - 核心工具：`ce_process_list`、`ce_attach`、`ce_regions`、`ce_read`（hexdump 渲染）、`ce_write`、

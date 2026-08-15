@@ -163,6 +163,8 @@
 → (M2) disasm / symbols.resolve / memory.alloc + memory.write(补丁)
 ```
 
+DSH 插件部署（安装/启动/更新/重启恢复）：见 `docs/dsh-deployment.md`。
+
 ## 7. 里程碑
 
 | 里程碑 | 能力 | 依赖 |
