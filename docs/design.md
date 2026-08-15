@@ -109,6 +109,21 @@
 | `symbols.list` | `{ "module": string? }` | `[{ "name", "address", "module" }]` |
 | `symbols.resolve` | `{ "name": string }` | `{ "address": u64 }` |
 
+### M5（防护 / 分析扩展）
+
+| method | params | result |
+|---|---|---|
+| `protect.status` | `{}` | `{ "detected": AntiCheatInfo[], "protected": bool, "kernel_protection": bool }` |
+| `thread.inject_dll` | `{ "pid", "path", "timeout_ms"? }` | `{ "thread_id", "completed", "exit_code" }` |
+| `thread.create_remote` | `{ "pid", "code": base64, "arg"?, "timeout_ms"? }` | `{ "thread_id", "completed", "exit_code" }` |
+| `debug.stack` | `{ "thread_id", "max_frames"? }` | `{ "count", "frames": [{ "frame", "rip", "rbp", "rsp", "module"?, "offset"? }] }` |
+
+- `AntiCheatInfo`: `{ "name", "process", "pid", "kernel" }`
+- `protect.status` 是**防护而非对抗**：只在附加前探测已知反作弊，不做任何隐藏/绕过。
+- `thread.create_remote` 的 `code` 为 x64 位置无关 shellcode（可用 `asm` 生成），须以 `ret` 结尾；
+  线程完成则自动释放远程内存，超时则保留（线程可能仍在运行）。
+- `debug.stack` 为 RBP 链回溯（尽力而为，要求目标开启帧指针）；断点命中后调用。
+
 ### 领域类型（见 `ce-core/src/types.rs`）
 
 - `ValueType`: `byte | int16 | int32 | int64 | float | double | string | bytes | binary`
@@ -143,14 +158,16 @@ M1 即覆盖 80% 实用场景（找值→改值→读内存）。
 2. **权限**：跨进程内存访问需管理员/同用户权限，与宿主沙箱策略冲突时需显式授权。
 3. **反作弊（防护而非对抗）**：无内核驱动/虚拟化，无法触及内核保护目标，也不追求绕过。
    反作弊常霸占内核（hook 系统调用、封锁句柄、占用调试接口、注入自身驱动），干扰用户态工作。
-   应对策略：
-   - **识别与规避**：attach 前检测已知反作弊进程（EAC / BattlEye / Vanguard / ACE 等），
-     存在时拒绝附加受保护目标并返回明确原因，避免触发检测、避免白做无用功。
-   - **错误分类与容错**：统一错误模型，区分"权限不足 / 句柄被拒 / 受保护页面 / 调试接口被占用"，
-     附建议动作；扫描遇到坏页跳过而不是中断。
+   应对策略（已实现部分见 §5 M5）：
+   - **识别与规避**：`protect.status` 在 attach 前检测已知反作弊进程（EAC / BattlEye /
+     Vanguard / ACE / GameGuard / XIGNCODE / PunkBuster / Denuvo / FACEIT），
+     返回 `protected` + `kernel_protection` 摘要，避免触发检测、避免白做无用功。
+   - **错误分类与容错**：attach 失败按 win32 错误码分类——进程不存在 / 权限不足 /
+     可能受 PPL/反作弊保护，附建议动作；扫描遇到坏页跳过而不是中断。
    - **Debug API 占用检测**：`WaitForDebugEvent`/`DebugActiveProcess` 失败时分类报告
-     （另一调试器已附加），不挂死。
-   - **干净恢复**：断点/监视点/补丁在 detach、stop、异常退出后自动恢复原字节，不留痕迹。
+     （另一调试器已附加），不挂死（待补）。
+   - **干净恢复**：断点/监视点/补丁在 detach、stop、异常退出后自动恢复原字节；
+     注入线程完成后自动释放远程内存，不留痕迹。
    - **最小足迹**：副作用严格限于会话内（进程句柄、已改字节），无全局 hook、无常驻线程，
      插件停止后完全无痕。
 4. **合规**：定位为个人、离线、教育/逆向分析用途，不承载联机作弊。

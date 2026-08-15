@@ -132,6 +132,10 @@ return {
     addTool('ce_process_list', 'List all processes on this machine (pid + name) for choosing a scan target.', {},
       async () => rpc('process.list', {}))
 
+    addTool('ce_protect_status', 'Detect known anti-cheat software running on this machine (EAC, BattlEye, Vanguard, Tencent ACE, GameGuard, etc.). Call BEFORE attaching to a target: if protected=true, attaching may fail or trigger the anti-cheat.',
+      {},
+      async () => rpc('protect.status', {}))
+
     addTool('ce_attach', 'Attach to a Windows process by pid for memory inspection.',
       { pid: { type: 'integer', description: 'Process id', required: true } },
       async (args) => rpc('process.attach', { pid: args.pid }))
@@ -334,6 +338,32 @@ return {
     addTool('ce_debug_single_step', 'Single-step one instruction of the current thread (after a breakpoint/watchpoint).',
       { thread_id: { type: 'integer', description: 'Thread id from a debug event', required: true } },
       async (args) => rpc('debug.single_step', { thread_id: args.thread_id }))
+
+    addTool('ce_debug_stack', 'Unwind the call stack of a suspended thread (RBP chain) at a breakpoint/watchpoint; frames annotated with module+offset.',
+      {
+        thread_id: { type: 'integer', description: 'Thread id from a debug event', required: true },
+        max_frames: { type: 'integer', description: 'Max frames to unwind (default 16)' },
+      },
+      async (args) => rpc('debug.stack', { thread_id: args.thread_id, max_frames: args.max_frames ?? 16 }))
+
+    addTool('ce_thread_inject_dll', 'Inject a DLL into a process: remote thread runs LoadLibraryW(path) in the target. Returns thread_id, completed, exit_code.',
+      {
+        pid: { type: 'integer', description: 'Process id', required: true },
+        path: { type: 'string', description: 'Absolute DLL path (e.g. C:\\\\path\\\\hook.dll)', required: true },
+        timeout_ms: { type: 'integer', description: 'Wait limit for the loader thread (default 10000)' },
+      },
+      async (args) => rpc('thread.inject_dll', { pid: args.pid, path: args.path, timeout_ms: args.timeout_ms ?? 10000 }))
+
+    addTool('ce_thread_create_remote', 'Execute raw x64 shellcode in a process via a remote thread (attack simulation / analysis hooks). Build the code with ce_asm; must end with ret. Returns thread_id, completed, exit_code.',
+      {
+        pid: { type: 'integer', description: 'Process id', required: true },
+        code: { type: 'array', items: { type: 'integer' }, description: 'Shellcode bytes as a decimal array (0-255); build the machine code with ce_asm first', required: true },
+        arg: { type: 'integer', description: 'Value passed as the thread parameter (default 0)' },
+        timeout_ms: { type: 'integer', description: 'Wait limit for the thread (default 10000)' },
+      },
+      async (args) => {
+        return rpc('thread.create_remote', { pid: args.pid, code: bytesToB64(args.code), arg: args.arg ?? 0, timeout_ms: args.timeout_ms ?? 10000 })
+      })
 
     // ---- 清理 ----
     ctx.effect(() => () => {

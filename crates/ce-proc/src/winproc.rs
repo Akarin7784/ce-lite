@@ -7,19 +7,22 @@ use std::os::raw::c_void;
 
 use ce_core::{Address, Arch, MemoryRegion, ModuleInfo, ProcessInfo};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
     CREATE_TOOLHELP_SNAPSHOT_FLAGS, MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE,
     TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS,
-    VIRTUAL_ALLOCATION_TYPE,
+    VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS,
+    MEM_RELEASE, VIRTUAL_ALLOCATION_TYPE,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject,
+    LPTHREAD_START_ROUTINE, PROCESS_ACCESS_RIGHTS, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 use super::{Process, ProcessError};
@@ -45,7 +48,7 @@ pub fn open(pid: u32) -> Result<Box<dyn Process>, ProcessError> {
     let access =
         PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION;
     let handle = unsafe { OpenProcess(access, false, pid) }
-        .map_err(|_| ProcessError::AccessDenied { pid })?;
+        .map_err(|e| classify_open_error(e, pid))?;
 
     let name = enumerate()
         .ok()
@@ -277,4 +280,227 @@ impl Drop for WindowsProcess {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.handle) };
     }
+}
+
+// ---- 防护：错误分类 ----
+
+/// 把 `OpenProcess` 失败分类为语义化错误（区分不存在 / 权限不足 / 其它）。
+fn classify_open_error(e: windows::core::Error, pid: u32) -> ProcessError {
+    let code = (e.code().0 as u32) & 0xFFFF;
+    match code {
+        // ERROR_ACCESS_DENIED：可能是受保护进程（PPL / 反作弊）。
+        5 => ProcessError::AccessDenied { pid },
+        // ERROR_INVALID_PARAMETER / ERROR_NOT_FOUND：进程不存在或已退出。
+        87 | 1168 => ProcessError::NotFound { pid },
+        _ => ProcessError::Platform(format!("OpenProcess failed (win32 error {code:#x}): {e}")),
+    }
+}
+
+// ---- 防护：反作弊感知 ----
+
+/// 已知反作弊清单：(显示名, 用户态进程名, 是否附带内核驱动组件)。
+const ANTI_CHEATS: &[(&str, &str, bool)] = &[
+    ("EasyAntiCheat", "EasyAntiCheat.exe", true),
+    ("EasyAntiCheat", "EasyAntiCheatService.exe", true),
+    ("BattlEye", "BEService.exe", true),
+    ("BattlEye", "BattlEye.exe", true),
+    ("Riot Vanguard", "vgc.exe", true),
+    ("Riot Vanguard", "vgtray.exe", true),
+    ("Tencent ACE", "ACE-BASE.exe", true),
+    ("Tencent ACE", "ACE-GAME.exe", true),
+    ("Tencent ACE", "ACENDA.exe", true),
+    ("Tencent ACE", "TenProtect.exe", true),
+    ("nProtect GameGuard", "GameMon.des", true),
+    ("nProtect GameGuard", "npggNT.des", true),
+    ("XIGNCODE3", "XIGNCODE3.exe", true),
+    ("XIGNCODE3", "XIGNCODE32.exe", true),
+    ("PunkBuster", "PnkBstrA.exe", true),
+    ("PunkBuster", "PnkBstrB.exe", true),
+    ("Denuvo Anti-Cheat", "denuvo-anti-cheat.exe", true),
+    ("FACEIT Anti-Cheat", "FACEIT.exe", true),
+    ("FACEIT Anti-Cheat", "FACEIT-SDK.exe", true),
+];
+
+/// 枚举当前运行的已知反作弊进程（防护：附加目标前先探测）。
+pub fn detect_anti_cheats() -> Vec<ce_core::AntiCheatInfo> {
+    let Ok(list) = enumerate() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (pid, name) in list {
+        let lower = name.to_lowercase();
+        for (ac_name, proc_name, kernel) in ANTI_CHEATS {
+            if lower == proc_name.to_lowercase() {
+                out.push(ce_core::AntiCheatInfo {
+                    name: ac_name.to_string(),
+                    process: name.clone(),
+                    pid,
+                    kernel: *kernel,
+                });
+            }
+        }
+    }
+    out
+}
+
+// ---- 分析：远程线程注入 ----
+
+/// 注入所需的进程访问权限（含创建远程线程）。
+fn inject_access() -> PROCESS_ACCESS_RIGHTS {
+    PROCESS_CREATE_THREAD
+        | PROCESS_QUERY_INFORMATION
+        | PROCESS_VM_OPERATION
+        | PROCESS_VM_READ
+        | PROCESS_VM_WRITE
+}
+
+/// 在已打开的进程句柄上创建远程线程并等待完成。
+fn run_remote_thread_on(
+    handle: HANDLE,
+    routine: LPTHREAD_START_ROUTINE,
+    arg: Option<*const c_void>,
+    timeout_ms: u64,
+) -> Result<ce_core::RemoteThreadResult, ProcessError> {
+    let mut thread_id = 0u32;
+    let thread = unsafe {
+        CreateRemoteThread(handle, None, 0, routine, arg, 0, Some(&mut thread_id)).map_err(|e| {
+            ProcessError::Other(format!(
+                "CreateRemoteThread failed (win32 error {:#x}): {e}",
+                (e.code().0 as u32) & 0xFFFF
+            ))
+        })?
+    };
+
+    let wait = unsafe { WaitForSingleObject(thread, timeout_ms.min(u32::MAX as u64) as u32) };
+    let completed = wait.0 == WAIT_OBJECT_0.0;
+    let mut exit_code = 0u32;
+    if completed {
+        let _ = unsafe { GetExitCodeThread(thread, &mut exit_code) };
+    }
+    unsafe { let _ = CloseHandle(thread); }
+
+    Ok(ce_core::RemoteThreadResult {
+        thread_id,
+        completed,
+        exit_code,
+    })
+}
+
+/// DLL 注入：远程线程执行目标进程内的 `LoadLibraryW(path)`。
+///
+/// 依赖 x64 下 kernel32 在所有进程同基址加载（仅支持同位数 x64 目标）。
+pub fn inject_dll(
+    pid: u32,
+    path: &str,
+    timeout_ms: u64,
+) -> Result<ce_core::RemoteThreadResult, ProcessError> {
+    let kernel32 = unsafe { GetModuleHandleW(windows::core::w!("kernel32.dll")) }
+        .map_err(|e| ProcessError::Other(format!("GetModuleHandleW(kernel32): {e}")))?;
+    let loadlib = unsafe { GetProcAddress(kernel32, windows::core::s!("LoadLibraryW")) };
+    let Some(loadlib) = loadlib else {
+        return Err(ProcessError::Other(
+            "LoadLibraryW not found in kernel32".to_string(),
+        ));
+    };
+    // FARPROC(Option<fn() -> isize>) → LPTHREAD_START_ROUTINE(Option<fn(*mut c_void) -> u32>)。
+    let routine: LPTHREAD_START_ROUTINE = unsafe { std::mem::transmute(loadlib) };
+
+    let handle = unsafe { OpenProcess(inject_access(), false, pid) }
+        .map_err(|e| classify_open_error(e, pid))?;
+
+    // 远程分配并写入宽字符串路径。
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let size = wide.len() * 2;
+    let mem = unsafe {
+        VirtualAllocEx(
+            handle,
+            None,
+            size,
+            VIRTUAL_ALLOCATION_TYPE(MEM_COMMIT | MEM_RESERVE),
+            PAGE_PROTECTION_FLAGS(PAGE_READWRITE),
+        )
+    };
+    if mem.is_null() {
+        unsafe { let _ = CloseHandle(handle); }
+        return Err(ProcessError::Alloc(
+            "VirtualAllocEx for dll path failed".to_string(),
+        ));
+    }
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            mem as *const c_void,
+            wide.as_ptr() as *const c_void,
+            size,
+            Some(&mut written),
+        )
+        .map_err(|e| ProcessError::Write {
+            address: mem as u64,
+            reason: format!("WriteProcessMemory for dll path: {e}"),
+        })?
+    }
+
+    let result = run_remote_thread_on(handle, routine, Some(mem as *const c_void), timeout_ms);
+    // 线程完成则释放远程路径内存；超时则保留（线程可能仍在运行）。
+    if result.as_ref().map(|r| r.completed).unwrap_or(false) {
+        unsafe { let _ = VirtualFreeEx(handle, mem, 0, MEM_RELEASE); }
+    }
+    unsafe { let _ = CloseHandle(handle); }
+    result
+}
+
+/// 代码注入：在目标进程内分配可执行内存，写入字节码并以远程线程执行。
+///
+/// `code` 为 x64 位置无关 shellcode（可用 `ce_asm` 生成），须以 `ret` 结尾；
+/// 返回时退出码即线程返回值。线程未在超时内完成时返回 `completed: false`，
+/// 分配的内存会保留（线程可能仍在运行），由调用方决定是否重试。
+pub fn create_remote(
+    pid: u32,
+    code: &[u8],
+    arg: u64,
+    timeout_ms: u64,
+) -> Result<ce_core::RemoteThreadResult, ProcessError> {
+    let handle = unsafe { OpenProcess(inject_access(), false, pid) }
+        .map_err(|e| classify_open_error(e, pid))?;
+
+    let mem = unsafe {
+        VirtualAllocEx(
+            handle,
+            None,
+            code.len(),
+            VIRTUAL_ALLOCATION_TYPE(MEM_COMMIT | MEM_RESERVE),
+            PAGE_PROTECTION_FLAGS(PAGE_EXECUTE_READWRITE),
+        )
+    };
+    if mem.is_null() {
+        unsafe { let _ = CloseHandle(handle); }
+        return Err(ProcessError::Alloc(
+            "VirtualAllocEx for shellcode failed".to_string(),
+        ));
+    }
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            mem as *const c_void,
+            code.as_ptr() as *const c_void,
+            code.len(),
+            Some(&mut written),
+        )
+        .map_err(|e| ProcessError::Write {
+            address: mem as u64,
+            reason: format!("WriteProcessMemory for shellcode: {e}"),
+        })?
+    }
+
+    // 裸指针 → 线程入口函数指针（同为 8 字节，transmute 转换）。
+    let routine: LPTHREAD_START_ROUTINE =
+        Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "system" fn(*mut c_void) -> u32>(mem) });
+    let result = run_remote_thread_on(handle, routine, Some(arg as *const c_void), timeout_ms);
+    if result.as_ref().map(|r| r.completed).unwrap_or(false) {
+        unsafe { let _ = VirtualFreeEx(handle, mem, 0, MEM_RELEASE); }
+    }
+    unsafe { let _ = CloseHandle(handle); }
+    result
 }

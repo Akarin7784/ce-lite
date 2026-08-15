@@ -11,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use ce_core::{Address, DebugEvent, Registers};
+use ce_core::{Address, DebugEvent, Registers, StackFrame};
 
 use windows::Win32::Foundation::{
     CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_ACCESS_VIOLATION,
@@ -244,6 +244,39 @@ impl Debugger {
         set_context(thread, &ctx)?;
         let _ = unsafe { CloseHandle(thread) };
         Ok(())
+    }
+
+    /// 回溯指定线程的调用栈（RBP 链，尽力而为；要求目标开启帧指针）。
+    ///
+    /// 每帧记录 RIP/RBP/RSP；栈底（rbp 为 0 / 不再前进 / 不可读）时停止。
+    pub fn stack(&self, thread_id: u32, max_frames: usize) -> Result<Vec<StackFrame>, String> {
+        let thread = open_thread(thread_id)?;
+        let ctx = get_context(thread)?;
+        let _ = unsafe { CloseHandle(thread) };
+
+        let mut frames = Vec::new();
+        let mut rbp = ctx.Rbp;
+        let mut rip = ctx.Rip;
+        let mut rsp = ctx.Rsp;
+        for _ in 0..max_frames {
+            frames.push(StackFrame { rip, rbp, rsp });
+            let mut next_rbp = 0u64;
+            let mut ret = 0u64;
+            // [rbp] = 上一帧 rbp；[rbp+8] = 返回地址。
+            if read_ptr(self.handle, rbp, &mut next_rbp)
+                && read_ptr(self.handle, rbp.wrapping_add(8), &mut ret)
+            {
+                if next_rbp == 0 || next_rbp <= rbp || ret == 0 {
+                    break;
+                }
+                rbp = next_rbp;
+                rip = ret;
+                rsp = rbp.wrapping_add(16);
+            } else {
+                break;
+            }
+        }
+        Ok(frames)
     }
 }
 
@@ -606,6 +639,22 @@ fn compute_dr7(wps: &[Option<Watchpoint>; 4]) -> u64 {
 }
 
 // ---- 底层辅助 ----
+
+/// 从目标进程读取 8 字节指针（栈回溯用）。
+fn read_ptr(handle: HANDLE, addr: Address, out: &mut u64) -> bool {
+    let mut nread = 0usize;
+    unsafe {
+        ReadProcessMemory(
+            handle,
+            addr as *const c_void,
+            out as *mut u64 as *mut c_void,
+            8,
+            Some(&mut nread),
+        )
+        .is_ok()
+            && nread == 8
+    }
+}
 
 fn open_thread(thread_id: u32) -> Result<HANDLE, String> {
     unsafe {

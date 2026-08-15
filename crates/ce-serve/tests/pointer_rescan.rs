@@ -105,5 +105,7 @@ fn pointer_rescan_drops_unstable_pointer() {
 
     // 5. 清理
     let _ = serve.child.kill();
+    let _ = serve.child.wait();
     let _ = target.kill();
+    let _ = target.wait();
 }

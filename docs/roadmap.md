@@ -1,6 +1,7 @@
 # ce-lite 开发路线图
 
-> 按"对 AI 辅助逆向的价值密度"排序。当前基线：M1-M4 ✅（35 个工具、17 单测 + 5 集成测试全绿）。
+> 按"对 AI 辅助逆向的价值密度"排序。当前基线：M1-M4 ✅ + 防护/分析首批 ✅
+> （17 单测 + 10 集成测试全绿，39 个 DSH 工具）。
 
 ## 指导原则
 
@@ -31,20 +32,17 @@
 
 ## 防护（非对抗）——与反作弊共存
 
-6. **反作弊感知（anti-cheat awareness）**
-   attach 前枚举已知反作弊进程（EasyAntiCheat / BattlEye / Vanguard / ACE 等），
-   存在时拒绝附加受保护目标并返回明确原因，避免触发检测、避免白做无用功。
-7. **错误分类与容错层**
-   统一错误模型：区分"权限不足 / 句柄被拒 / 受保护页面 / 调试接口被占用"，
-   附建议动作；内存读失败跳过坏页而非中断扫描；`VirtualProtectEx` 失败可重试。
-8. **Debug API 占用检测**
-   `DebugActiveProcess` / `WaitForDebugEvent` 失败时分类报告（另一调试器已附加），不挂死。
-9. **干净恢复**
-   断点/监视点/补丁在 detach、stop、异常退出后自动恢复原字节；trampoline 回滚；
-   会话结束后无任何残留（句柄关闭、线程退出）。
-10. **最小足迹声明**
-    副作用严格限于会话内：无全局 hook、无全局注册、无常驻线程；文档明确
-    "个人/离线/教育/逆向分析"定位与"不提供规避检测能力"的边界。
+- [x] 6. **反作弊感知（anti-cheat awareness）**：`protect.status` 已实现——枚举已知反作弊
+  进程（EasyAntiCheat / BattlEye / Vanguard / ACE / GameGuard / XIGNCODE / PunkBuster /
+  Denuvo / FACEIT），返回 `protected` 与 `kernel_protection` 摘要。集成测试通过。
+- [x] 7. **错误分类与容错层**（首批）：attach 失败已分类——进程不存在 / 权限不足 /
+  可能受 PPL/反作弊保护（win32 错误码映射）。待补：扫描坏页跳过、`VirtualProtectEx` 失败重试。
+- [ ] 8. **Debug API 占用检测**：`DebugActiveProcess` / `WaitForDebugEvent` 失败分类
+  （另一调试器已附加），不挂死。
+- [x] 9. **干净恢复**（已有基础）：断点/监视点在 detach、stop、异常退出后自动恢复原字节；
+  注入线程完成后自动释放远程内存。待补：异常退出时的全局清理钩子。
+- [ ] 10. **最小足迹声明**：文档化"个人/离线/教育/逆向分析"定位与边界（README 已声明，
+  待补完整章节）。
 
 ## 第二梯队：核心算法与平台深化
 
@@ -52,9 +50,10 @@
 12. **扫描性能**：candidate 并行（rayon）、SIMD 值比较、区域缓存复用。
 13. **指针扫描增强**：多结果合并（union）、偏移聚类（高频偏移）、链持久化。
 14. **反汇编工具链**：CALL 目标交叉引用（"谁调用了这个函数"）、函数边界识别、反汇编缓存。
-15. **调试器深化**：线程列表/挂起恢复、模块加载卸载事件、DLL 注入（`CreateRemoteThread`）、
-    内联钩子（alloc + asm 已有 → 自动生成 trampoline）。
-16. **调用栈回溯**：RBP 链遍历或 `RtlVirtualUnwind`，断点命中直接呈现调用栈。
+- [x] 15. **远程线程注入**（首批）：`thread.inject_dll`（LoadLibraryW 注入）+
+  `thread.create_remote`（任意 shellcode 远程执行，含 arg/超时/退出码）。集成测试通过。
+- [x] 16. **调用栈回溯**（首批）：`debug.stack`——RBP 链回溯，断点命中直接呈现调用栈，
+  帧标注 module+offset。集成测试通过。待补：`RtlVirtualUnwind` 精确解卷。
 17. **32 位目标（Wow64）**：`WOW64_CONTEXT`、DR 寄存器布局、iced-x86 bitness 切换。
 18. **Linux 支持（ptrace）**：`/proc/pid/mem` 读写 + ptrace attach + 软断点（`nix` crate）。
 
@@ -80,6 +79,6 @@
 ## 推荐执行顺序
 
 **立即**：#1 MCP（打通所有 AI 客户端）、#3 PDB（调试器从"能用"到"好用"）、
-#6 反作弊感知 + #7 错误容错（防护落地）、#19 CI（工程质量）。
+#8 Debug API 占用检测 + #9 异常退出清理（防护收尾）、#19 CI（工程质量）。
 **紧接着**：#2 访问者闭环、#4 structure spawn、#5 会话持久化 ——
 把"扫描→指针→结构→谁在写"串成一条 AI 可自助跑完的流水线。

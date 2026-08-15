@@ -90,5 +90,7 @@ fn struct_define_and_read() {
     assert_eq!(score["value"], serde_json::json!(777));
 
     let _ = serve.child.kill();
+    let _ = serve.child.wait();
     let _ = target.kill();
+    let _ = target.wait();
 }

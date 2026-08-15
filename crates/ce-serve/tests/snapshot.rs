@@ -98,7 +98,9 @@ fn snapshot_diff_finds_changes() {
     assert_eq!(changes[1]["new"].as_u64().unwrap(), 0x03);
 
     let _ = serve.child.kill();
+    let _ = serve.child.wait();
     let _ = target.kill();
+    let _ = target.wait();
 }
 
 fn base64_encode(bytes: &[u8]) -> String {

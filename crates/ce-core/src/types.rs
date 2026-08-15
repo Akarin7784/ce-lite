@@ -214,3 +214,32 @@ pub struct StructFieldValue {
     pub value_type: ValueType,
     pub value: Value,
 }
+
+/// 一个已知反作弊（含其内核驱动组件）的检测结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntiCheatInfo {
+    pub name: String,
+    /// 匹配到的用户态进程名。
+    pub process: String,
+    pub pid: u32,
+    /// 该反作弊是否附带内核驱动组件（内核保护更严，风险更高）。
+    pub kernel: bool,
+}
+
+/// 远程线程执行结果（DLL 注入 / 代码注入）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteThreadResult {
+    pub thread_id: u32,
+    /// 是否在超时内完成（线程已退出）。
+    pub completed: bool,
+    /// 线程退出码（`completed` 时有效）。
+    pub exit_code: u32,
+}
+
+/// 调用栈的一帧（RBP 链回溯，尽力而为）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackFrame {
+    pub rip: u64,
+    pub rbp: u64,
+    pub rsp: u64,
+}

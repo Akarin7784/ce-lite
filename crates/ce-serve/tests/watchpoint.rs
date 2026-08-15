@@ -120,5 +120,7 @@ fn watchpoint_triggers_on_write() {
     serve.rpc(10, "debug.detach", "{}");
 
     let _ = serve.child.kill();
+    let _ = serve.child.wait();
     let _ = target.kill();
+    let _ = target.wait();
 }

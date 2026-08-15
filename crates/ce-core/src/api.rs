@@ -44,6 +44,10 @@ pub mod method {
     pub const STRUCT_READ: &str = "struct.read";
     pub const STRUCT_LIST: &str = "struct.list";
     pub const STRUCT_DELETE: &str = "struct.delete";
+    pub const PROTECT_STATUS: &str = "protect.status";
+    pub const THREAD_INJECT_DLL: &str = "thread.inject_dll";
+    pub const THREAD_CREATE_REMOTE: &str = "thread.create_remote";
+    pub const DEBUG_STACK: &str = "debug.stack";
 }
 
 /// JSON-RPC 请求。
@@ -268,4 +272,34 @@ pub struct StructReadParams {
 #[derive(Debug, Deserialize)]
 pub struct StructNameParams {
     pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InjectDllParams {
+    pub pid: u32,
+    pub path: String,
+    /// 等待注入线程完成的最长毫秒数（默认 10000）。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRemoteParams {
+    pub pid: u32,
+    /// base64 编码的待执行字节码（x64 位置无关 shellcode，须以 `ret` 结尾）。
+    pub code: String,
+    /// 传给线程入口的 `lpParameter`（默认 0）。
+    #[serde(default)]
+    pub arg: Option<u64>,
+    /// 等待线程完成的最长毫秒数（默认 10000）。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StackParams {
+    pub thread_id: u32,
+    /// 回溯的最大帧数（默认 16）。
+    #[serde(default)]
+    pub max_frames: Option<usize>,
 }

@@ -44,30 +44,38 @@ cargo build -p ce-serve
 - [x] 单步执行：`debug.single_step`（配合监视点/断点追踪执行流，集成测试）
 - [x] 内存快照/差异：`memory.snapshot` + `memory.diff`（区域监视，找出哪些字节变了，集成测试）
 - [x] M4：结构体定义/读取（`struct.define`/`struct.read`/`struct.list`/`struct.delete`，集成测试）
+- [x] 防护：反作弊感知（`protect.status` 检测 EAC/BattlEye/Vanguard/ACE 等）+ attach 错误分类
+  （区分进程不存在 / 权限不足 / 受保护，集成测试）
+- [x] 分析：远程线程注入（`thread.inject_dll` 加载 DLL、`thread.create_remote` 执行任意 shellcode，集成测试）
+- [x] 分析：调用栈回溯（`debug.stack`，RBP 链，断点命中后直接呈现调用栈 + 模块标注，集成测试）
 - [ ] ARM（按计划暂缓）
 
 验证方式：
 
 ```powershell
-cargo test                                            # 17 单元测试 + 5 集成测试（指针/调试器/监视点/快照/结构体）
+cargo test                                            # 17 单元测试 + 10 集成测试
 cargo test -p ce-serve --test pointer_rescan          # 二次快照去噪（跨进程，含 decoy 翻转）
 cargo test -p ce-serve --test debugger                # 调试器：断点命中 + 寄存器读取
 cargo test -p ce-serve --test watchpoint              # 硬件监视点：写触发 + 单步
 cargo test -p ce-serve --test snapshot                # 内存快照/差异比对
 cargo test -p ce-serve --test structure               # 结构体定义/读取字段
+cargo test -p ce-serve --test protect                 # 反作弊感知 + attach 错误分类
+cargo test -p ce-serve --test inject                  # 远程线程注入（shellcode + DLL）
+cargo test -p ce-serve --test stack                   # 调用栈回溯
 pwsh -File scripts/smoke-test.ps1                     # M1+M2 跨进程端到端冒烟测试
 ```
 
 ## DeepSeek Harness 集成
 
 ce-lite 已封装为一个 DSH 动态插件（Host 半区），把 ce-serve 的能力暴露为
-模型可调用的 35 个工具。源码存档在 `dsh/celit-plugin.js`。
+模型可调用的 39 个工具。源码存档在 `dsh/celit-plugin.js`。
 
-- 插件 ID：`celit-1`（当前 `celit-1/pkg-8`）
+- 插件 ID：`celit-1`（动态插件不随 DSH 重启保留；重启后需用存档重新 `cordis_define`+`cordis_run` 部署）
 - 行为：`apply()` 派生 `ce-serve.exe`，在 stdio 上做 JSON-RPC 关联，注册工具
 - 核心工具：`ce_process_list`、`ce_attach`、`ce_regions`、`ce_read`、`ce_write`、
   `ce_alloc`、`ce_memory_snapshot`、`ce_memory_diff`、`ce_scan_new`、`ce_scan_next`、
   `ce_scan_results`、`ce_scan_close`、`ce_disasm`、`ce_asm`、`ce_symbols_resolve`
+- 防护工具：`ce_protect_status`（attach 前检测已知反作弊，返回 protected/kernel_protection）
 - 结构体工具：`ce_struct_define`（name + fields[{name,value_type,offset,size?}]）、
   `ce_struct_read`（按定义在地址处解读各字段）、`ce_struct_list`、`ce_struct_delete`
 - 指针扫描工具：`ce_pointer_scan`（一次性）、`ce_pointer_scan_start` + `ce_pointer_rescan`
@@ -77,17 +85,21 @@ ce-lite 已封装为一个 DSH 动态插件（Host 半区），把 ce-serve 的�
   `ce_debug_registers_set`、`ce_debug_detach`
 - 硬件监视点：`ce_debug_watchpoint_set`（address/size/on_read/on_write）、
   `ce_debug_watchpoint_clear`
-- 单步执行：`ce_debug_single_step`
+- 单步执行：`ce_debug_single_step`；调用栈：`ce_debug_stack`（RBP 链回溯，帧标注 module+offset）
+- 注入工具：`ce_thread_inject_dll`（远程线程跑 LoadLibraryW）、`ce_thread_create_remote`
+  （远程线程执行任意 x64 shellcode，可用 `ce_asm` 生成）
 - 生命周期：插件停止时终止子进程并反注册工具
 
 在 DSH 会话中激活后，模型即可用以下工作流驱动逆向：
 
 ```
-ce_process_list → ce_attach(pid) → ce_scan_new(int32, exact, 100)
+ce_protect_status → ce_process_list → ce_attach(pid) → ce_scan_new(int32, exact, 100)
 → ce_scan_next(changed) → ce_scan_results → ce_read(address) → ce_disasm(...)
 → ce_pointer_scan_start(address) → (值变化后) ce_pointer_rescan → ce_pointer_results
-→ ce_debug_attach(pid) → ce_debug_breakpoint_set(addr) → ce_debug_wait → ce_debug_registers → ce_debug_continue
-→ ce_debug_watchpoint_set(addr, size, on_write) → ce_debug_wait → ce_debug_registers  (找出谁在写这个地址)
+→ ce_debug_attach(pid) → ce_debug_breakpoint_set(addr) → ce_debug_wait → ce_debug_registers
+→ ce_debug_stack(thread_id) → ce_debug_continue                     (断点处看调用栈)
+→ ce_debug_watchpoint_set(addr, size, on_write) → ce_debug_wait → ce_debug_registers  (谁在写这个地址)
+→ ce_asm("...") → ce_thread_create_remote(pid, code)                (攻击模拟/远程执行)
 ```
 
 > 注意：插件硬编码了 `ce-serve.exe` 的绝对路径

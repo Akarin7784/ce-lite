@@ -560,6 +560,68 @@ fn dispatch(session: &mut Session, id: u64, method: &str, params: serde_json::Va
             ))?;
             Ok(Response::ok(id, serde_json::json!({ "deleted": true })))
         }
+        // ---- 防护：反作弊感知 ----
+        method::PROTECT_STATUS => {
+            let detected = ce_proc::detect_anti_cheats();
+            let kernel = detected.iter().any(|a| a.kernel);
+            Ok(Response::ok(
+                id,
+                serde_json::json!({
+                    "detected": detected,
+                    "protected": !detected.is_empty(),
+                    "kernel_protection": kernel,
+                }),
+            ))
+        }
+        // ---- 分析：远程线程注入 ----
+        method::THREAD_INJECT_DLL => {
+            let p: api::InjectDllParams = parse(params)?;
+            let timeout = p.timeout_ms.unwrap_or(10_000);
+            let r = ce_proc::inject_dll(p.pid, &p.path, timeout).map_err(app)?;
+            Ok(Response::ok(id, r))
+        }
+        method::THREAD_CREATE_REMOTE => {
+            let p: api::CreateRemoteParams = parse(params)?;
+            let code = STANDARD.decode(&p.code).map_err(|e| {
+                (api::error_code::INVALID_PARAMS, format!("bad base64: {e}"))
+            })?;
+            let timeout = p.timeout_ms.unwrap_or(10_000);
+            let r = ce_proc::create_remote(p.pid, &code, p.arg.unwrap_or(0), timeout).map_err(app)?;
+            Ok(Response::ok(id, r))
+        }
+        // ---- 分析：调用栈回溯 ----
+        method::DEBUG_STACK => {
+            let p: api::StackParams = parse(params)?;
+            let dbg = debugger_ref(session)?;
+            let frames = dbg
+                .stack(p.thread_id, p.max_frames.unwrap_or(16))
+                .map_err(|e| (api::error_code::APPLICATION, e))?;
+            let modules = proc_ref(session)?.modules().map_err(app)?;
+            let out: Vec<serde_json::Value> = frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let mut v = serde_json::json!({
+                        "frame": i,
+                        "rip": f.rip,
+                        "rbp": f.rbp,
+                        "rsp": f.rsp,
+                    });
+                    if let Some(m) = modules
+                        .iter()
+                        .find(|m| f.rip >= m.base && f.rip < m.base + m.size)
+                    {
+                        v["module"] = serde_json::json!(m.name);
+                        v["offset"] = serde_json::json!(format!("0x{:x}", f.rip - m.base));
+                    }
+                    v
+                })
+                .collect();
+            Ok(Response::ok(
+                id,
+                serde_json::json!({ "count": out.len(), "frames": out }),
+            ))
+        }
         other => Err((
             api::error_code::METHOD_NOT_FOUND,
             format!("method not found: {other}"),

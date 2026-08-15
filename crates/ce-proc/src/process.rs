@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum ProcessError {
     #[error("process {pid} not found")]
     NotFound { pid: u32 },
-    #[error("process {pid} is not accessible (insufficient privileges?)")]
+    #[error("process {pid} is not accessible: access denied (needs elevation, or the process may be PPL/protected by anti-cheat)")]
     AccessDenied { pid: u32 },
     #[error("read failed at 0x{address:x}: {reason}")]
     Read { address: Address, reason: String },
